@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/settingsRootScrollView"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="#0A0A0C"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:id="@+id/settingsContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="18dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="18dp"
+        android:paddingBottom="40dp">
+
+        <!-- Top Drag Handle -->
+        <View
+            android:layout_width="40dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="14dp"
+            android:background="@drawable/bg_drag_handle" />
+
+        <!-- Navigation Bar: Close Button, Title, Subtitle -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:layout_marginBottom="16dp">
+
+            <ImageButton
+                android:id="@+id/backBtn"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Close"
+                android:src="@drawable/ic_arrow_back"
+                app:tint="#FFFFFF" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/settingsTitle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Telegram Configuration"
+                    android:textColor="#FFFFFF"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/settingsSubtitle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="1dp"
+                    android:text="MTProto credentials &amp; bot worker pool"
+                    android:textColor="#71717A"
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Credentials Card -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/credentialsCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            app:cardBackgroundColor="#141417"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp"
+            app:strokeColor="#27272A"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <!-- Section Label -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="14dp"
+                    android:fontFamily="monospace"
+                    android:text="TELEGRAM CREDENTIALS"
+                    android:textColor="#71717A"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <!-- 1. API ID -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="6dp"
+                    android:text="Telegram API ID"
+                    android:textColor="#D4D4D8"
+                    android:textSize="12.5sp"
+                    android:textStyle="bold" />
+
+                <EditText
+                    android:id="@+id/apiIdInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:layout_marginBottom="12dp"
+                    android:background="@drawable/bg_input_field"
+                    android:hint="e.g. 28069584"
+                    android:importantForAutofill="no"
+                    android:inputType="number"
+                    android:paddingStart="14dp"
+                    android:paddingEnd="14dp"
+                    android:textColor="#FFFFFF"
+                    android:textColorHint="#52525B"
+                    android:textSize="14sp" />
+
+                <!-- 2. API Hash -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="6dp"
+                    android:text="Telegram API Hash"
+                    android:textColor="#D4D4D8"
+                    android:textSize="12.5sp"
+                    android:textStyle="bold" />
+
+                <EditText
+                    android:id="@+id/apiHashInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:layout_marginBottom="12dp"
+                    android:background="@drawable/bg_input_field"
+                    android:hint="32-character hex hash"
+                    android:importantForAutofill="no"
+                    android:inputType="textPassword"
+                    android:paddingStart="14dp"
+                    android:paddingEnd="14dp"
+                    android:textColor="#FFFFFF"
+                    android:textColorHint="#52525B"
+                    android:textSize="14sp" />
+
+                <!-- 3. Channel / Supergroup Chat ID -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="6dp"
+                    android:text="Channel / Group Chat ID"
+                    android:textColor="#D4D4D8"
+                    android:textSize="12.5sp"
+                    android:textStyle="bold" />
+
+                <EditText
+                    android:id="@+id/chatIdInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:layout_marginBottom="12dp"
+                    android:background="@drawable/bg_input_field"
+                    android:hint="e.g. -1004347476515"
+                    android:importantForAutofill="no"
+                    android:inputType="numberSigned"
+                    android:paddingStart="14dp"
+                    android:paddingEnd="14dp"
+                    android:textColor="#FFFFFF"
+                    android:textColorHint="#52525B"
+                    android:textSize="14sp" />
+
+                <!-- 4. Bot Tokens -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="6dp"
+                    android:text="Bot Tokens (Comma-separated for multi-bot pool)"
+                    android:textColor="#D4D4D8"
+                    android:textSize="12.5sp"
+                    android:textStyle="bold" />
+
+                <EditText
+                    android:id="@+id/botTokensInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:layout_marginBottom="12dp"
+                    android:background="@drawable/bg_input_field"
+                    android:hint="token1, token2, token3..."
+                    android:importantForAutofill="no"
+                    android:inputType="textPassword"
+                    android:paddingStart="14dp"
+                    android:paddingEnd="14dp"
+                    android:textColor="#FFFFFF"
+                    android:textColorHint="#52525B"
+                    android:textSize="14sp" />
+
+                <!-- 5. System Topic ID -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="6dp"
+                    android:text="System Topic ID (Optional, for DB snapshots)"
+                    android:textColor="#D4D4D8"
+                    android:textSize="12.5sp"
+                    android:textStyle="bold" />
+
+                <EditText
+                    android:id="@+id/systemTopicInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:layout_marginBottom="18dp"
+                    android:background="@drawable/bg_input_field"
+                    android:hint="1"
+                    android:importantForAutofill="no"
+                    android:inputType="number"
+                    android:paddingStart="14dp"
+                    android:paddingEnd="14dp"
+                    android:textColor="#FFFFFF"
+                    android:textColorHint="#52525B"
+                    android:textSize="14sp" />
+
+                <!-- Primary Save Button -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/saveBtn"
+                    style="@style/Widget.Material3.Button"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:text="Save &amp; Apply Changes"
+                    android:textColor="#000000"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    app:backgroundTint="#FFFFFF"
+                    app:cornerRadius="24dp" />
+
+                <!-- Secondary Clear Button -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/clearBtn"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="40dp"
+                    android:layout_marginTop="6dp"
+                    android:text="Clear Saved Credentials"
+                    android:textColor="#EF4444"
+                    android:textSize="12.5sp" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Information / Topic Mapping Schema Card -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:cardBackgroundColor="#141417"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp"
+            app:strokeColor="#27272A"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="8dp"
+                    android:fontFamily="monospace"
+                    android:text="CUSTOM PLAYLIST MAPPING SCHEMA"
+                    android:textColor="#71717A"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <!-- Monospace Code Box -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/bg_code_box"
+                    android:orientation="vertical"
+                    android:padding="12dp">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:fontFamily="monospace"
+                        android:text="#playlist&#10;&#10;name: Hindi&#10;topicid: 3&#10;&#10;name: English&#10;topicid: 2"
+                        android:textColor="#38BDF8"
+                        android:textSize="12sp"
+                        android:lineSpacingExtra="3dp" />
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="• Post the schema above in General (Topic 1) to map forum topic IDs to custom playlist titles in StreamX.\n• New tracks and schema edits are automatically watched and synced in the background."
+                    android:textColor="#A1A1AA"
+                    android:textSize="11.5sp"
+                    android:lineSpacingExtra="2dp" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

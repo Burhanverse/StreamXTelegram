@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">StreamX Telegram Extension</string>
+    <string name="playback_channel_name">StreamX Audio Engine</string>
+    <string name="playback_channel_description">Background audio playback service</string>
+</resources>

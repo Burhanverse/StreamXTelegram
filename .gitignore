@@ -1,4 +1,11 @@
-prompt.md
-task.md
+StreamXBot-main/
+StreamX/
+apk_decompiled/
+.gradle/
+.kotlin/
+build/
+*.md
 *.apk
 *.zip
+local.properties
+*.keystore

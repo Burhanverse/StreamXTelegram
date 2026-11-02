@@ -1,0 +1,289 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootScrollView"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:id="@+id/mainContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="16dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="36dp">
+
+        <!-- Top App Bar with Title, Subtitle, and Gear Icon -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:layout_marginBottom="16dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/appTitle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="StreamX Telegram"
+                    android:textColor="#FFFFFF"
+                    android:textSize="22sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/appSubtitle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="On-Device MTProto Audio Engine &amp; Metadata Sync"
+                    android:textColor="#A1A1AA"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Gear Icon for Credential Configuration -->
+            <ImageButton
+                android:id="@+id/gearBtn"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Configure Credentials"
+                android:src="@drawable/ic_settings"
+                app:tint="#FFFFFF" />
+        </LinearLayout>
+
+        <!-- 1. Merged Engine Status & Live Diagnostics Terminal Card -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/statusTerminalCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            app:cardBackgroundColor="#141417"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="0dp"
+            app:strokeColor="#27272A"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <!-- Header Row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:fontFamily="monospace"
+                        android:text="ENGINE STATUS &amp; DIAGNOSTICS"
+                        android:textColor="#A1A1AA"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/statusPill"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:fontFamily="monospace"
+                        android:paddingStart="10dp"
+                        android:paddingTop="4dp"
+                        android:paddingEnd="10dp"
+                        android:paddingBottom="4dp"
+                        android:text="● STOPPED"
+                        android:textColor="#FFA726"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/statusDetails"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:fontFamily="monospace"
+                    android:text="Checking local engine..."
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp" />
+
+                <!-- WakeLock Control Row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:layout_marginTop="12dp"
+                    android:layout_marginBottom="12dp">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Streaming WakeLock"
+                            android:textColor="#FFFFFF"
+                            android:textSize="13sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="1dp"
+                            android:text="Off-screen &amp; multitasking protection"
+                            android:textColor="#A1A1AA"
+                            android:textSize="11sp" />
+                    </LinearLayout>
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/wakeLockToggleBtn"
+                        style="@style/Widget.Material3.Button.TonalButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:text="⚡ WakeLock: OFF"
+                        android:textColor="#A1A1AA"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        app:backgroundTint="#1E1E22"
+                        app:cornerRadius="18dp"
+                        app:strokeColor="#27272A"
+                        app:strokeWidth="1dp" />
+                </LinearLayout>
+
+                <!-- Subtle Card Divider -->
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginBottom="10dp"
+                    android:background="#27272A" />
+
+                <!-- Embedded Live Terminal Log Viewport -->
+                <com.music.streamx.extensions.telegram.TerminalLogView
+                    android:id="@+id/terminalView"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- 2. Database & Sync Controls Card -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/opsCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            app:cardBackgroundColor="#141417"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="0dp"
+            app:strokeColor="#27272A"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="12dp"
+                    android:fontFamily="monospace"
+                    android:text="DATABASE &amp; SYNC CONTROLS"
+                    android:textColor="#A1A1AA"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <!-- Sync Channel Button -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/syncBtn"
+                    style="@style/Widget.Material3.Button"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:text="Sync Channel / Catch-up"
+                    android:textColor="#000000"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    app:backgroundTint="#FFFFFF"
+                    app:cornerRadius="24dp" />
+
+                <TextView
+                    android:id="@+id/syncStatusText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:layout_marginBottom="12dp"
+                    android:fontFamily="monospace"
+                    android:text="Sync status: Ready"
+                    android:textColor="#A1A1AA"
+                    android:textSize="11sp" />
+
+                <!-- Backup & Restore Row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/backupBtn"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_marginEnd="6dp"
+                        android:layout_weight="1"
+                        android:text="Backup DB"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        app:cornerRadius="24dp"
+                        app:strokeColor="#27272A" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/restoreBtn"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_marginStart="6dp"
+                        android:layout_weight="1"
+                        android:text="Restore DB"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        app:cornerRadius="24dp"
+                        app:strokeColor="#27272A" />
+                </LinearLayout>
+
+                <!-- Detele DB & Rescan From Scratch Button -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/rescanBtn"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="44dp"
+                    android:layout_marginTop="8dp"
+                    android:text="Delete DB &amp; Rescan"
+                    android:textColor="#FF6B6B"
+                    android:textSize="12sp"
+                    app:cornerRadius="24dp"
+                    app:strokeColor="#4A1E1E" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>
