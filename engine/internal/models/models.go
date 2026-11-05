@@ -1,6 +1,69 @@
 package models
 
-import "time"
+import (
+	"context"
+	"time"
+)
+
+type ContextKey string
+
+const (
+	ContextKeyTrackID    ContextKey = "stream_track_id"
+	ContextKeyBackground ContextKey = "stream_is_background"
+	ContextKeyPriority   ContextKey = "stream_priority"
+)
+
+// Priority represents the priority level of a bot network request.
+type Priority int
+
+const (
+	PriorityBackground Priority = 0
+	PriorityPrefetch   Priority = 1
+	PriorityPlayback   Priority = 2
+)
+
+// WithPriority decorates ctx with the given request priority.
+func WithPriority(ctx context.Context, p Priority) context.Context {
+	return context.WithValue(ctx, ContextKeyPriority, p)
+}
+
+// PriorityFromContext retrieves the priority from ctx, defaulting to PriorityPlayback
+// unless marked as background.
+func PriorityFromContext(ctx context.Context) Priority {
+	if val, ok := ctx.Value(ContextKeyPriority).(Priority); ok {
+		return val
+	}
+	if IsBackgroundContext(ctx) {
+		return PriorityBackground
+	}
+	return PriorityPlayback
+}
+
+// WithTrackID decorates ctx with the active trackID for telemetry tracking.
+func WithTrackID(ctx context.Context, trackID string) context.Context {
+	return context.WithValue(ctx, ContextKeyTrackID, trackID)
+}
+
+// TrackIDFromContext retrieves the trackID from ctx if present.
+func TrackIDFromContext(ctx context.Context) string {
+	if val, ok := ctx.Value(ContextKeyTrackID).(string); ok {
+		return val
+	}
+	return ""
+}
+
+// WithBackground marks ctx as a background/enrichment operation.
+func WithBackground(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ContextKeyBackground, true)
+}
+
+// IsBackgroundContext checks if ctx was marked as a background operation.
+func IsBackgroundContext(ctx context.Context) bool {
+	if val, ok := ctx.Value(ContextKeyBackground).(bool); ok {
+		return val
+	}
+	return false
+}
 
 // Track represents an audio track canonical record.
 type Track struct {
@@ -15,12 +78,16 @@ type Track struct {
 	CreatedAt   time.Time `json:"created_at"`
 
 	// Enrichment and Deduplication metadata
-	Fingerprint  string `json:"fingerprint,omitempty"`
-	CoverURL     string `json:"cover_url,omitempty"`
-	ThumbURL     string `json:"thumb_url,omitempty"`
-	Lyrics       string `json:"lyrics,omitempty"`
-	SyncedLyrics string `json:"synced_lyrics,omitempty"`
-	Year         int    `json:"year,omitempty"`
+	Fingerprint  string    `json:"fingerprint,omitempty"`
+	CoverURL     string    `json:"cover_url,omitempty"`
+	ThumbURL     string    `json:"thumb_url,omitempty"`
+	Lyrics       string    `json:"lyrics,omitempty"`
+	SyncedLyrics string    `json:"synced_lyrics,omitempty"`
+	Year         int       `json:"year,omitempty"`
+	MatchSource  string    `json:"match_source,omitempty"`
+	MatchScore   float64   `json:"match_score,omitempty"`
+	MatchedAt    time.Time `json:"matched_at,omitempty"`
+	MetaVersion  int       `json:"meta_version,omitempty"`
 
 	// Primary Telegram source reference
 	FileID        string `json:"file_id,omitempty"`
@@ -143,5 +210,6 @@ type Config struct {
 	FilesDir      string   `json:"files_dir"`
 	CacheDir      string   `json:"cache_dir"`
 	AuthToken     string   `json:"auth_token,omitempty"`
+	Debug         bool     `json:"debug,omitempty"`
 }
 

@@ -546,7 +546,7 @@ func parseMP4DataAtom(data []byte) (string, []byte, string) {
 				return "", payload, "image/png"
 			} else if len(payload) > 32 {
 				// Fallback binary detection
-				if bytes.Index(payload, []byte{0xFF, 0xD8, 0xFF}) != -1 {
+				if bytes.Contains(payload, []byte{0xFF, 0xD8, 0xFF}) {
 					return "", payload, "image/jpeg"
 				}
 				return "", payload, "image/jpeg"

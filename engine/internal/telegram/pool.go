@@ -29,6 +29,8 @@ type Pool struct {
 	primaryWorker    *ClientWorker
 	secondaryWorkers []*ClientWorker
 	allWorkers       []*ClientWorker
+	statsListener    WorkerStatsListener
+	roundRobin       uint64
 	mu               sync.RWMutex
 	cancel           context.CancelFunc
 	tracks           map[string]*models.Track
@@ -241,6 +243,16 @@ func (p *Pool) ReadyWorkerCount() int {
 	return count
 }
 
+// SetStatsListener registers a telemetry stats listener across all workers in the pool.
+func (p *Pool) SetStatsListener(l WorkerStatsListener) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.statsListener = l
+	for _, w := range p.allWorkers {
+		w.SetStatsListener(l)
+	}
+}
+
 // IsReady returns true if the primary bot is authenticated and connected.
 func (p *Pool) IsReady() bool {
 	p.mu.RLock()
@@ -248,32 +260,72 @@ func (p *Pool) IsReady() bool {
 	return p.primaryWorker != nil && p.primaryWorker.Ready
 }
 
-// AcquireWorker selects the least-loaded ready worker for parallel chunk downloading.
+// AcquireWorker selects the least-loaded ready and non-cooling worker.
+// Ties are spread round-robin so the primary worker is not monopolized.
 func (p *Pool) AcquireWorker() *ClientWorker {
+	return p.AcquireWorkerWithPriority(models.PriorityPlayback)
+}
+
+// AcquireWorkerWithPriority selects a ready worker respecting priority lanes and worker cooldowns.
+func (p *Pool) AcquireWorkerWithPriority(priority models.Priority) *ClientWorker {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	var best *ClientWorker
-	var lowestLoad int64 = 1<<62 - 1
-
+	var candidates []*ClientWorker
 	for _, w := range p.allWorkers {
-		if !w.Ready {
-			continue
-		}
-		load := atomic.LoadInt64(&w.Workload)
-		if load < lowestLoad {
-			lowestLoad = load
-			best = w
+		if w.Ready && !w.IsCoolingDown() {
+			candidates = append(candidates, w)
 		}
 	}
 
-	if best == nil {
+	if len(candidates) == 0 {
+		// If all workers are cooling down, select the worker with the shortest cooldown remaining
+		var leastCooling *ClientWorker
+		var minRem time.Duration = 1<<62 - 1
+		for _, w := range p.allWorkers {
+			if w.Ready {
+				rem := w.CooldownRemaining()
+				if rem < minRem {
+					minRem = rem
+					leastCooling = w
+				}
+			}
+		}
+		if leastCooling != nil {
+			return leastCooling
+		}
 		return p.primaryWorker
 	}
-	return best
+
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+
+	// Find the minimum workload among candidates
+	minLoad := int64(1<<62 - 1)
+	for _, w := range candidates {
+		load := atomic.LoadInt64(&w.Workload)
+		if load < minLoad {
+			minLoad = load
+		}
+	}
+
+	// Collect tied candidates
+	var tied []*ClientWorker
+	for _, w := range candidates {
+		if atomic.LoadInt64(&w.Workload) == minLoad {
+			tied = append(tied, w)
+		}
+	}
+
+	// Spread ties round-robin so worker 0 is not favored over secondary workers
+	idx := int(atomic.LoadUint64(&p.roundRobin) % uint64(len(tied)))
+	atomic.AddUint64(&p.roundRobin, 1)
+	return tied[idx]
 }
 
-// DispatchChunkDownload handles downloading a chunk with worker striping and automatic reference refresh.
+// DispatchChunkDownload handles downloading a chunk with worker striping, fallback across workers,
+// and automatic reference refresh.
 func (p *Pool) DispatchChunkDownload(
 	ctx context.Context,
 	chatID int64,
@@ -281,56 +333,126 @@ func (p *Pool) DispatchChunkDownload(
 	offset int64,
 	limit int,
 ) ([]byte, error) {
-	worker := p.AcquireWorker()
-	if worker == nil || !worker.Ready {
-		return nil, ErrWorkerNotReady
+	priority := models.PriorityFromContext(ctx)
+	p.mu.RLock()
+	workerCount := len(p.allWorkers)
+	p.mu.RUnlock()
+
+	maxAttempts := workerCount
+	if maxAttempts < 2 {
+		maxAttempts = 2
 	}
 
-	location, _, _, err := worker.FetchFileLocation(ctx, chatID, msgID, false)
-	if err != nil {
-		// Fallback to primary bot
-		if worker != p.primaryWorker && p.primaryWorker.Ready {
-			worker = p.primaryWorker
-			location, _, _, err = worker.FetchFileLocation(ctx, chatID, msgID, false)
+	var lastErr error
+	triedWorkers := make(map[int]bool)
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
 		}
+
+		worker := p.AcquireWorkerWithPriority(priority)
+		if worker == nil || !worker.Ready {
+			return nil, ErrWorkerNotReady
+		}
+
+		// Avoid immediately retrying the same worker if other workers exist
+		if triedWorkers[worker.Index] && len(triedWorkers) < workerCount {
+			for _, alt := range p.allWorkers {
+				if alt.Ready && !alt.IsCoolingDown() && !triedWorkers[alt.Index] {
+					worker = alt
+					break
+				}
+			}
+		}
+		triedWorkers[worker.Index] = true
+
+		location, _, _, err := worker.FetchFileLocation(ctx, chatID, msgID, false)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch file location for chunk: %w", err)
+			// Fallback to primary bot for location resolution if needed
+			if worker != p.primaryWorker && p.primaryWorker.Ready {
+				location, _, _, err = p.primaryWorker.FetchFileLocation(ctx, chatID, msgID, false)
+			}
+			if err != nil {
+				lastErr = err
+				worker.MarkFailure()
+				continue
+			}
+		}
+
+		chunk, err := worker.DownloadChunk(ctx, location, offset, limit)
+		if err == nil {
+			worker.MarkSuccess()
+			return chunk, nil
+		}
+
+		lastErr = err
+		worker.MarkFailure()
+
+		if errors.Is(err, ErrFileReferenceExpired) {
+			log.Warnf("File reference expired for msg %d on worker #%d; refreshing...", msgID, worker.Index)
+			worker.locationMu.Lock()
+			delete(worker.locationCache, msgID)
+			worker.locationMu.Unlock()
+
+			freshLoc, _, _, refreshErr := worker.FetchFileLocation(ctx, chatID, msgID, true)
+			if refreshErr != nil && worker != p.primaryWorker && p.primaryWorker.Ready {
+				freshLoc, _, _, refreshErr = p.primaryWorker.FetchFileLocation(ctx, chatID, msgID, true)
+			}
+			if refreshErr == nil {
+				chunk, retryErr := worker.DownloadChunk(ctx, freshLoc, offset, limit)
+				if retryErr == nil {
+					worker.MarkSuccess()
+					return chunk, nil
+				}
+				lastErr = retryErr
+			}
 		}
 	}
 
-	chunk, err := worker.DownloadChunk(ctx, location, offset, limit)
-	if errors.Is(err, ErrFileReferenceExpired) {
-		log.Warnf("File reference expired for msg %d on worker #%d; refreshing...", msgID, worker.Index)
-
-		// Clear cached location on worker
-		worker.locationMu.Lock()
-		delete(worker.locationCache, msgID)
-		worker.locationMu.Unlock()
-
-		// Refresh fresh location directly from MTProto
-		freshLoc, _, _, refreshErr := worker.FetchFileLocation(ctx, chatID, msgID, true)
-		if refreshErr != nil && worker != p.primaryWorker && p.primaryWorker.Ready {
-			worker = p.primaryWorker
-			freshLoc, _, _, refreshErr = worker.FetchFileLocation(ctx, chatID, msgID, true)
-		}
-		if refreshErr != nil {
-			return nil, fmt.Errorf("refresh file reference failed: %w", refreshErr)
-		}
-
-		// Retry chunk download with refreshed location
-		return worker.DownloadChunk(ctx, freshLoc, offset, limit)
+	if lastErr != nil {
+		return nil, lastErr
 	}
-
-	return chunk, err
+	return nil, fmt.Errorf("chunk download failed after %d attempts", maxAttempts)
 }
 
-// DownloadChunk downloads an audio chunk using the least loaded available worker.
+// DownloadChunk downloads an audio chunk using an eligible worker with fallback.
 func (p *Pool) DownloadChunk(ctx context.Context, location *tg.InputDocumentFileLocation, offset int64, limit int) ([]byte, error) {
-	worker := p.AcquireWorker()
-	if worker == nil || !worker.Ready {
-		return nil, ErrWorkerNotReady
+	priority := models.PriorityFromContext(ctx)
+	p.mu.RLock()
+	workerCount := len(p.allWorkers)
+	p.mu.RUnlock()
+
+	maxAttempts := workerCount
+	if maxAttempts < 2 {
+		maxAttempts = 2
 	}
-	return worker.DownloadChunk(ctx, location, offset, limit)
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		worker := p.AcquireWorkerWithPriority(priority)
+		if worker == nil || !worker.Ready {
+			return nil, ErrWorkerNotReady
+		}
+
+		chunk, err := worker.DownloadChunk(ctx, location, offset, limit)
+		if err == nil {
+			worker.MarkSuccess()
+			return chunk, nil
+		}
+		lastErr = err
+		worker.MarkFailure()
+	}
+
+	return nil, lastErr
 }
 
 // RegisterTrack registers or caches a track canonical record.

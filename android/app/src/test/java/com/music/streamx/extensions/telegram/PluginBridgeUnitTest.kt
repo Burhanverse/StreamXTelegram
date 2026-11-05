@@ -20,7 +20,8 @@ class PluginBridgeUnitTest {
                 "654321:XYZ-DEF1234ghIkl-zyx57W2v1u123ew22",
                 "789012:UVW-DEF1234ghIkl-zyx57W2v1u123ew33"
             ),
-            systemTopicId = 42
+            systemTopicId = 42,
+            debug = true
         )
 
         val jsonString = original.toJSON()
@@ -31,6 +32,7 @@ class PluginBridgeUnitTest {
         assertEquals(original.apiHash, restored.apiHash)
         assertEquals(original.chatId, restored.chatId)
         assertEquals(original.systemTopicId, restored.systemTopicId)
+        assertEquals(original.debug, restored.debug)
         assertEquals(3, restored.botTokens.size)
         assertEquals("123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11", restored.botTokens[0])
         assertEquals("654321:XYZ-DEF1234ghIkl-zyx57W2v1u123ew22", restored.botTokens[1])

@@ -21,6 +21,13 @@ var (
 	ErrWorkerNotReady       = errors.New("worker client is not ready")
 )
 
+// WorkerStatsListener enables recording MTProto download latencies, flood waits, and errors.
+type WorkerStatsListener interface {
+	RecordDownload(ctx context.Context, botIndex int, offset int64, limit int, duration time.Duration, err error)
+	RecordFloodWait(ctx context.Context, botIndex int, wait time.Duration)
+	RecordError(ctx context.Context, botIndex int, errType string)
+}
+
 // ClientWorker manages a single MTProto client connection in the pool.
 type ClientWorker struct {
 	ID                  int64
@@ -31,15 +38,57 @@ type ClientWorker struct {
 	Bot                 bool
 	Ready               bool
 	Workload            int64
+	cooldownUntilNano   int64
+	consecutiveFailures int32
 	Client              *telegram.Client
 	API                 *tg.Client
 	db                  *database.DB
+	statsListener       WorkerStatsListener
 
 	channelAccessHashes map[int64]int64
 	channelAccessMu     sync.RWMutex
 
 	locationCache       map[int32]*models.WorkerLocation
 	locationMu          sync.RWMutex
+}
+
+// SetStatsListener attaches a telemetry collector to this worker.
+func (w *ClientWorker) SetStatsListener(l WorkerStatsListener) {
+	w.statsListener = l
+}
+
+// IsCoolingDown returns true if the worker is currently undergoing a FLOOD_WAIT or circuit cooldown.
+func (w *ClientWorker) IsCoolingDown() bool {
+	return time.Now().UnixNano() < atomic.LoadInt64(&w.cooldownUntilNano)
+}
+
+// CooldownRemaining returns the time left before this worker can accept new tasks.
+func (w *ClientWorker) CooldownRemaining() time.Duration {
+	rem := atomic.LoadInt64(&w.cooldownUntilNano) - time.Now().UnixNano()
+	if rem <= 0 {
+		return 0
+	}
+	return time.Duration(rem)
+}
+
+// MarkCooldown puts the worker into a cooldown state for the specified duration.
+func (w *ClientWorker) MarkCooldown(d time.Duration) {
+	until := time.Now().Add(d).UnixNano()
+	atomic.StoreInt64(&w.cooldownUntilNano, until)
+}
+
+// MarkSuccess clears consecutive failure counters after a successful request.
+func (w *ClientWorker) MarkSuccess() {
+	atomic.StoreInt32(&w.consecutiveFailures, 0)
+}
+
+// MarkFailure increments the failure count and activates a circuit breaker if errors repeat.
+func (w *ClientWorker) MarkFailure() {
+	fails := atomic.AddInt32(&w.consecutiveFailures, 1)
+	if fails >= 3 {
+		// Circuit breaker: back off for 5 seconds
+		w.MarkCooldown(5 * time.Second)
+	}
 }
 
 // NewClientWorker creates an unstarted MTProto worker instance.
@@ -173,7 +222,15 @@ func (w *ClientWorker) FetchFileLocation(ctx context.Context, chatID int64, msgI
 			ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: int(msgID)}},
 		})
 		if err != nil {
+			if strings.Contains(strings.ToUpper(err.Error()), "FILE_MIGRATE") {
+				if w.statsListener != nil {
+					w.statsListener.RecordError(ctx, w.Index, "FILE_MIGRATE")
+				}
+			}
 			if wait, isFlood := ParseFloodWait(err); isFlood {
+				if w.statsListener != nil {
+					w.statsListener.RecordFloodWait(ctx, w.Index, wait)
+				}
 				log.Warnf("Worker #%d hit FLOOD_WAIT (%v) fetching message %d", w.Index, wait, msgID)
 				_ = SleepWithContext(ctx, wait)
 			}
@@ -276,17 +333,42 @@ func (w *ClientWorker) DownloadChunk(ctx context.Context, location *tg.InputDocu
 	var err error
 
 	for attempt := 0; attempt < 3; attempt++ {
+		start := time.Now()
 		res, err = w.API.UploadGetFile(ctx, req)
+		dur := time.Since(start)
+
+		if w.statsListener != nil {
+			w.statsListener.RecordDownload(ctx, w.Index, alignedOffset, limit, dur, err)
+		}
+
 		if err == nil {
 			break
 		}
 
 		if strings.Contains(strings.ToUpper(err.Error()), "FILE_REFERENCE") {
+			if w.statsListener != nil {
+				w.statsListener.RecordError(ctx, w.Index, "FILE_REFERENCE_EXPIRED")
+			}
 			return nil, ErrFileReferenceExpired
 		}
 
+		if strings.Contains(strings.ToUpper(err.Error()), "FILE_MIGRATE") {
+			if w.statsListener != nil {
+				w.statsListener.RecordError(ctx, w.Index, "FILE_MIGRATE")
+			}
+		}
+
 		if wait, isFlood := ParseFloodWait(err); isFlood {
+			w.MarkCooldown(wait)
+			if w.statsListener != nil {
+				w.statsListener.RecordFloodWait(ctx, w.Index, wait)
+			}
 			log.Warnf("Worker #%d UploadGetFile hit FLOOD_WAIT (%v) at offset %d", w.Index, wait, offset)
+			priority := models.PriorityFromContext(ctx)
+			if priority == models.PriorityPlayback && wait > 1*time.Second {
+				// Do not block playback hot path; route to another worker immediately
+				return nil, err
+			}
 			if sleepErr := SleepWithContext(ctx, wait); sleepErr != nil {
 				return nil, sleepErr
 			}
@@ -297,7 +379,12 @@ func (w *ClientWorker) DownloadChunk(ctx context.Context, location *tg.InputDocu
 			return nil, ctx.Err()
 		}
 
-		time.Sleep(150 * time.Millisecond)
+		jitter := 50*time.Millisecond + time.Duration((alignedOffset+int64(attempt*37))%100)*time.Millisecond
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(jitter):
+		}
 	}
 
 	if err != nil {

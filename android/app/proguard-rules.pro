@@ -1,3 +1,7 @@
+# Optimization and size reduction
+-optimizationpasses 5
+-allowaccessmodification
+
 # Gomobile runtime and Go wrappers
 -keep class go.** { *; }
 -keep class engine.** { *; }

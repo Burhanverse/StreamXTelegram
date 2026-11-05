@@ -30,7 +30,8 @@ object KeyStoreManager {
         val apiHash: String,
         val chatId: Long,
         val botTokens: List<String>,
-        val systemTopicId: Int = 0
+        val systemTopicId: Int = 0,
+        val debug: Boolean = false
     ) {
         fun toJSON(): String {
             val json = JSONObject()
@@ -49,6 +50,7 @@ object KeyStoreManager {
             }
             json.put("worker_tokens", workerArr)
             json.put("system_topic_id", systemTopicId)
+            json.put("debug", debug)
             return json.toString()
         }
 
@@ -79,7 +81,8 @@ object KeyStoreManager {
                     apiHash = json.optString("api_hash", ""),
                     chatId = json.optLong("chat_id", 0L),
                     botTokens = tokens,
-                    systemTopicId = json.optInt("system_topic_id", 0)
+                    systemTopicId = json.optInt("system_topic_id", 0),
+                    debug = json.optBoolean("debug", false)
                 )
             }
         }

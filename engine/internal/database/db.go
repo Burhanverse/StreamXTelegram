@@ -289,6 +289,64 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 5 {
+		tx, err := d.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		_, err = tx.ExecContext(ctx, `
+			CREATE TABLE IF NOT EXISTS enrichment_state (
+				track_id TEXT PRIMARY KEY,
+				status TEXT NOT NULL,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				last_attempt DATETIME NOT NULL,
+				reason TEXT NOT NULL DEFAULT '',
+				expires_at DATETIME NOT NULL,
+				FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+			);
+			CREATE INDEX IF NOT EXISTS idx_enrichment_state_status ON enrichment_state(status, expires_at);
+		`)
+		if err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?);`, time.Now()); err != nil {
+			return err
+		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+
+	if version < 6 {
+		tx, err := d.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		alterStmts := []string{
+			`ALTER TABLE tracks ADD COLUMN match_source TEXT DEFAULT '';`,
+			`ALTER TABLE tracks ADD COLUMN match_score REAL DEFAULT 0.0;`,
+			`ALTER TABLE tracks ADD COLUMN matched_at DATETIME;`,
+			`ALTER TABLE tracks ADD COLUMN meta_version INTEGER DEFAULT 2;`,
+		}
+		for _, stmt := range alterStmts {
+			_, _ = tx.ExecContext(ctx, stmt)
+		}
+
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?);`, time.Now()); err != nil {
+			return err
+		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -447,25 +505,79 @@ func (d *DB) UpdateTrackFullMetadata(ctx context.Context, id, title, artist, alb
 	return err
 }
 
-// ListUnenrichedTrackIDs returns track IDs that have no valid HTTPS cover_url, thumb_url, or have default album name.
+// UpdateTrackMatchMetadata persists the matching provenance, score, and metadata schema version.
+func (d *DB) UpdateTrackMatchMetadata(ctx context.Context, id, matchSource string, matchScore float64, metaVersion int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.ExecContext(ctx, `
+		UPDATE tracks SET
+			match_source = ?,
+			match_score = ?,
+			matched_at = ?,
+			meta_version = ?
+		WHERE id = ?;
+	`, matchSource, matchScore, time.Now(), metaVersion, id)
+	return err
+}
+
+// SaveEnrichmentState updates the persistent enrichment status, attempt count, and negative cache TTL.
+func (d *DB) SaveEnrichmentState(ctx context.Context, trackID string, status string, attempts int, reason string, ttl time.Duration) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	expiresAt := time.Now().Add(ttl)
+	_, err := d.db.ExecContext(ctx, `
+		INSERT INTO enrichment_state (track_id, status, attempts, last_attempt, reason, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(track_id) DO UPDATE SET
+			status = excluded.status,
+			attempts = attempts + 1,
+			last_attempt = excluded.last_attempt,
+			reason = excluded.reason,
+			expires_at = excluded.expires_at;
+	`, trackID, status, attempts, time.Now(), reason, expiresAt)
+	return err
+}
+
+// IsEnrichmentNegativeCached returns true if trackID previously failed and its negative cache TTL is still active.
+func (d *DB) IsEnrichmentNegativeCached(ctx context.Context, trackID string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var count int
+	err := d.db.QueryRowContext(ctx, `
+		SELECT COUNT(1) FROM enrichment_state
+		WHERE track_id = ? AND status = 'failed' AND expires_at > ?;
+	`, trackID, time.Now()).Scan(&count)
+	return err == nil && count > 0
+}
+
+// ListUnenrichedTrackIDs returns track IDs that have no valid cover_url, have low match score,
+// or have default album/artist names, respecting negative cache TTL and capping batch size.
 func (d *DB) ListUnenrichedTrackIDs(ctx context.Context) ([]string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT id FROM tracks
-		WHERE cover_url IS NULL 
-		   OR cover_url = '' 
-		   OR NOT cover_url LIKE 'https://%' 
-		   OR thumb_url IS NULL 
-		   OR thumb_url = '' 
-		   OR NOT thumb_url LIKE 'https://%' 
-		   OR album = 'Telegram Music' 
-		   OR album = ''
-		   OR artist = 'Unknown Artist'
-		   OR artist = ''
-		ORDER BY created_at DESC
-	`)
+		SELECT t.id FROM tracks t
+		LEFT JOIN enrichment_state e ON t.id = e.track_id
+		WHERE (
+			t.cover_url IS NULL 
+			OR t.cover_url = '' 
+			OR (t.meta_version < 2 AND NOT t.cover_url LIKE 'content://%')
+			OR (t.match_score < 0.70 AND NOT t.cover_url LIKE 'content://%')
+			OR t.thumb_url IS NULL 
+			OR t.thumb_url = '' 
+			OR t.album = 'Telegram Music' 
+			OR t.album = ''
+			OR t.artist = 'Unknown Artist'
+			OR t.artist = ''
+		)
+		AND (e.track_id IS NULL OR (e.status != 'success' AND e.expires_at <= ?))
+		ORDER BY t.created_at DESC
+		LIMIT 100;
+	`, time.Now())
 	if err != nil {
 		return nil, err
 	}

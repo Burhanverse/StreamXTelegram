@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -22,6 +23,12 @@ type CatchupService struct {
 	pool       *Pool
 	db         *database.DB
 	enrichment *services.EnrichmentService
+	syncing    atomic.Bool
+}
+
+// IsSyncing reports whether initial or incremental catchup synchronization is actively in progress.
+func (s *CatchupService) IsSyncing() bool {
+	return s.syncing.Load()
 }
 
 // NewCatchupService creates a new catch-up service using the multi-bot pool, database, and enrichment pipeline.
@@ -36,6 +43,9 @@ func NewCatchupService(pool *Pool, db *database.DB, enrichment *services.Enrichm
 // SyncChannel syncs new and edited audio tracks for a channel into the local database.
 // It uses updates.getChannelDifference when pts > 0 and falls back to high-water mark scanning.
 func (s *CatchupService) SyncChannel(ctx context.Context, chatID int64) error {
+	s.syncing.Store(true)
+	defer s.syncing.Store(false)
+
 	primary := s.pool.Primary()
 	if primary == nil || !primary.Ready {
 		return ErrWorkerNotReady

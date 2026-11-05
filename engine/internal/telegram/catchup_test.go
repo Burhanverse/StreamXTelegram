@@ -93,8 +93,8 @@ func TestExtractAudioTrack(t *testing.T) {
 	if trackFile == nil || sourceFile == nil {
 		t.Fatalf("ExtractAudioTrack failed to infer audio from .mp3 extension")
 	}
-	if trackFile.Title != "awesome_song" {
-		t.Errorf("Expected title 'awesome_song', got '%s'", trackFile.Title)
+	if trackFile.Title != "awesome song" {
+		t.Errorf("Expected title 'awesome song', got '%s'", trackFile.Title)
 	}
 	if trackFile.Artist != "Unknown Artist" {
 		t.Errorf("Expected artist 'Unknown Artist', got '%s'", trackFile.Artist)

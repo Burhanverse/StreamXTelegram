@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -60,7 +62,7 @@ func formatTopicSubtitle(trackCount int) string {
 
 func (s *Server) formatThumbnailURL(rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
-	if strings.HasPrefix(rawURL, "https://") {
+	if strings.HasPrefix(rawURL, "https://") || strings.HasPrefix(rawURL, "content://") {
 		return rawURL
 	}
 	return ""
@@ -70,11 +72,18 @@ func (s *Server) trackArtworkURL(tr *models.Track) string {
 	if tr == nil {
 		return ""
 	}
+	// Source order: (a) embedded art from local file served through content:// provider first
+	if s.artworkDir != "" {
+		artFile := filepath.Join(s.artworkDir, tr.ID+".jpg")
+		if fi, err := os.Stat(artFile); err == nil && fi.Size() > 0 {
+			return fmt.Sprintf("content://com.music.streamx.extensions.telegram.source/art/%s", tr.ID)
+		}
+	}
 	thumbURL := strings.TrimSpace(tr.CoverURL)
 	if thumbURL == "" && tr.ThumbURL != "" {
 		thumbURL = strings.TrimSpace(tr.ThumbURL)
 	}
-	if strings.HasPrefix(thumbURL, "https://") {
+	if strings.HasPrefix(thumbURL, "https://") || strings.HasPrefix(thumbURL, "content://") {
 		return thumbURL
 	}
 	if s.enrichment != nil {
@@ -87,7 +96,7 @@ func (s *Server) trackArtworkURL(tr *models.Track) string {
 
 func (s *Server) topicArtworkURL(ctx context.Context, topicID int32, explicitArt string) string {
 	explicitArt = strings.TrimSpace(explicitArt)
-	if strings.HasPrefix(explicitArt, "https://") {
+	if strings.HasPrefix(explicitArt, "https://") || strings.HasPrefix(explicitArt, "content://") {
 		return explicitArt
 	}
 	if s.db != nil {
@@ -105,7 +114,7 @@ func (s *Server) topicArtworkURL(ctx context.Context, topicID int32, explicitArt
 
 func (s *Server) playlistArtworkURL(ctx context.Context, plID string, explicitArt string) string {
 	explicitArt = strings.TrimSpace(explicitArt)
-	if strings.HasPrefix(explicitArt, "https://") {
+	if strings.HasPrefix(explicitArt, "https://") || strings.HasPrefix(explicitArt, "content://") {
 		return explicitArt
 	}
 	if s.db != nil {
@@ -123,16 +132,29 @@ func (s *Server) playlistArtworkURL(ctx context.Context, plID string, explicitAr
 
 func (s *Server) albumArtworkURL(ctx context.Context, albumTitle string, explicitCover string) string {
 	explicitCover = strings.TrimSpace(explicitCover)
-	if strings.HasPrefix(explicitCover, "https://") {
+	if strings.HasPrefix(explicitCover, "https://") || strings.HasPrefix(explicitCover, "content://") {
 		return explicitCover
 	}
 	if s.db != nil {
-		tracks, err := s.db.GetAlbumTracks(ctx, albumTitle, 10)
-		if err == nil {
+		tracks, err := s.db.GetAlbumTracks(ctx, albumTitle, 50)
+		if err == nil && len(tracks) > 0 {
+			// Consensus cover: most common cover among its tracks
+			counts := make(map[string]int)
 			for _, tr := range tracks {
 				if art := s.trackArtworkURL(tr); art != "" {
-					return art
+					counts[art]++
 				}
+			}
+			var bestArt string
+			var maxCount int
+			for art, count := range counts {
+				if count > maxCount {
+					maxCount = count
+					bestArt = art
+				}
+			}
+			if bestArt != "" {
+				return bestArt
 			}
 		}
 	}
@@ -141,19 +163,10 @@ func (s *Server) albumArtworkURL(ctx context.Context, albumTitle string, explici
 
 func (s *Server) artistArtworkURL(ctx context.Context, artistName string, explicitThumb string) string {
 	explicitThumb = strings.TrimSpace(explicitThumb)
-	if strings.HasPrefix(explicitThumb, "https://") {
+	if strings.HasPrefix(explicitThumb, "https://") || strings.HasPrefix(explicitThumb, "content://") {
 		return explicitThumb
 	}
-	if s.db != nil {
-		tracks, err := s.db.GetArtistTracks(ctx, artistName, 10)
-		if err == nil {
-			for _, tr := range tracks {
-				if art := s.trackArtworkURL(tr); art != "" {
-					return art
-				}
-			}
-		}
-	}
+	// Do not reuse track cover art as an artist photo (Prompt 4 requirement)
 	return ""
 }
 
@@ -949,7 +962,7 @@ func (s *Server) trackToStreamXItem(tr *models.Track) map[string]interface{} {
 	}
 	albumID := ""
 	if tr.Album != "" {
-		albumID = metadata.AlbumID(tr.Album, tr.Year)
+		albumID = metadata.AlbumIDWithArtist(tr.Album, tr.Artist, tr.Year)
 	}
 
 	return map[string]interface{}{

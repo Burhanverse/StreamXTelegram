@@ -31,6 +31,7 @@ func cacheKey(trackID string, offset int64, limit int) string {
 }
 
 // Get retrieves a prefetched chunk from the cache if available.
+// It returns an immutable slice directly (zero-copy) to avoid allocation overhead on high-frequency reads.
 func (c *PrefetchCache) Get(trackID string, offset int64, limit int) ([]byte, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -38,10 +39,15 @@ func (c *PrefetchCache) Get(trackID string, offset int64, limit int) ([]byte, bo
 	if !ok {
 		return nil, false
 	}
-	// Return a copy to prevent race conditions during concurrent slice operations
-	copied := make([]byte, len(data))
-	copy(copied, data)
-	return copied, true
+	return data, true
+}
+
+// Has checks if a chunk is currently in cache without retrieving the data.
+func (c *PrefetchCache) Has(trackID string, offset int64, limit int) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.chunks[cacheKey(trackID, offset, limit)]
+	return ok
 }
 
 // Put adds a prefetched chunk into the cache, evicting the oldest entry when at capacity.

@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -25,6 +27,37 @@ const (
 type Streamer struct {
 	client        telegram.Client
 	prefetchCache *PrefetchCache
+	diagnostics   *StreamDiagnostics
+	diagMu        sync.RWMutex
+
+	sessions      map[int64]*StreamSession
+	sessionsMu    sync.RWMutex
+	nextSessionID int64
+}
+
+type telemetryBridge struct {
+	diag *StreamDiagnostics
+}
+
+func (tb *telemetryBridge) RecordDownload(ctx context.Context, botIndex int, offset int64, limit int, duration time.Duration, err error) {
+	if tb.diag != nil {
+		trackID := TrackIDFromContext(ctx)
+		tb.diag.RecordBotDownload(trackID, botIndex, duration, err)
+	}
+}
+
+func (tb *telemetryBridge) RecordFloodWait(ctx context.Context, botIndex int, wait time.Duration) {
+	if tb.diag != nil {
+		trackID := TrackIDFromContext(ctx)
+		tb.diag.RecordFloodWait(trackID, botIndex, wait)
+	}
+}
+
+func (tb *telemetryBridge) RecordError(ctx context.Context, botIndex int, errType string) {
+	if tb.diag != nil {
+		trackID := TrackIDFromContext(ctx)
+		tb.diag.RecordError(trackID, errType)
+	}
 }
 
 // NewStreamer creates a new audio streamer with parallel chunk prefetching.
@@ -32,6 +65,101 @@ func NewStreamer(client telegram.Client) *Streamer {
 	return &Streamer{
 		client:        client,
 		prefetchCache: NewPrefetchCache(16),
+		sessions:      make(map[int64]*StreamSession),
+	}
+}
+
+// OpenStream initializes a dedicated StreamSession for trackID, resolving metadata once.
+func (s *Streamer) OpenStream(ctx context.Context, trackID string) (int64, error) {
+	s.StartSession(trackID)
+	handle := atomic.AddInt64(&s.nextSessionID, 1)
+
+	session, err := NewStreamSession(ctx, handle, trackID, s)
+	if err != nil {
+		s.ReleaseSession(trackID)
+		return 0, err
+	}
+
+	s.sessionsMu.Lock()
+	s.sessions[handle] = session
+	s.sessionsMu.Unlock()
+
+	return handle, nil
+}
+
+// ReadStream reads up to length bytes at offset from the open session designated by handle.
+func (s *Streamer) ReadStream(handle int64, offset int64, length int) ([]byte, error) {
+	s.sessionsMu.RLock()
+	session, ok := s.sessions[handle]
+	s.sessionsMu.RUnlock()
+
+	if !ok || session == nil {
+		return nil, fmt.Errorf("invalid or closed stream handle: %d", handle)
+	}
+
+	return session.Read(offset, length)
+}
+
+// CloseStream terminates the stream session, cancelling in-flight work and releasing resources.
+func (s *Streamer) CloseStream(handle int64) {
+	s.sessionsMu.Lock()
+	session, ok := s.sessions[handle]
+	if ok {
+		delete(s.sessions, handle)
+	}
+	s.sessionsMu.Unlock()
+
+	if ok && session != nil {
+		session.Close()
+	}
+}
+
+// ActiveSessionCount returns the number of active streaming playback sessions.
+func (s *Streamer) ActiveSessionCount() int {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	return len(s.sessions)
+}
+
+// IsPlaybackActive returns true if any playback session is currently open.
+func (s *Streamer) IsPlaybackActive() bool {
+	return s.ActiveSessionCount() > 0
+}
+
+// SetDiagnostics enables or attaches streaming telemetry diagnostics.
+func (s *Streamer) SetDiagnostics(diag *StreamDiagnostics) {
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+	s.diagnostics = diag
+	if pool, ok := s.client.(*telegram.Pool); ok && diag != nil {
+		pool.SetStatsListener(&telemetryBridge{diag: diag})
+	}
+}
+
+// Diagnostics returns the active telemetry diagnostics recorder if attached.
+func (s *Streamer) Diagnostics() *StreamDiagnostics {
+	s.diagMu.RLock()
+	defer s.diagMu.RUnlock()
+	return s.diagnostics
+}
+
+// StartSession initiates an active playback session for trackID.
+func (s *Streamer) StartSession(trackID string) {
+	s.diagMu.RLock()
+	diag := s.diagnostics
+	s.diagMu.RUnlock()
+	if diag != nil {
+		diag.StartSession(trackID)
+	}
+}
+
+// ReleaseSession terminates the active playback session for trackID and outputs summary telemetry.
+func (s *Streamer) ReleaseSession(trackID string) {
+	s.diagMu.RLock()
+	diag := s.diagnostics
+	s.diagMu.RUnlock()
+	if diag != nil {
+		diag.ReleaseSession(trackID)
 	}
 }
 
@@ -48,6 +176,15 @@ func (s *Streamer) GetTrackSize(ctx context.Context, trackID string) (int64, err
 }
 
 func (s *Streamer) downloadChunk(ctx context.Context, track *models.Track, location *tg.InputDocumentFileLocation, offset int64, limit int) ([]byte, error) {
+	if track != nil {
+		ctx = WithTrackID(ctx, track.ID)
+		s.diagMu.RLock()
+		diag := s.diagnostics
+		s.diagMu.RUnlock()
+		if diag != nil {
+			diag.RecordChunkRequest(track.ID, offset)
+		}
+	}
 	if pool, ok := s.client.(*telegram.Pool); ok && track != nil && track.ChatID != 0 && track.MsgID != 0 {
 		return pool.DispatchChunkDownload(ctx, track.ChatID, track.MsgID, offset, limit)
 	}
@@ -61,6 +198,9 @@ func (s *Streamer) triggerPrefetch(track *models.Track, location *tg.InputDocume
 	go func() {
 		prefetchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		if track != nil {
+			prefetchCtx = WithTrackID(prefetchCtx, track.ID)
+		}
 		preChunk, preErr := s.downloadChunk(prefetchCtx, track, location, offset, limit)
 		if preErr == nil && len(preChunk) > 0 {
 			s.prefetchCache.Put(track.ID, offset, limit, preChunk)
@@ -68,11 +208,81 @@ func (s *Streamer) triggerPrefetch(track *models.Track, location *tg.InputDocume
 	}()
 }
 
+// ReadHeader reads only up to maxBytes for file header inspection without triggering
+// prefetch and without polluting or evicting the playback cache.
+func (s *Streamer) ReadHeader(ctx context.Context, trackID string, maxBytes int) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = 256 * 1024
+	}
+	// Align to 4096 (4 KB boundary for MTProto), max 1 MB
+	limit := ((maxBytes + 4095) / 4096) * 4096
+	if limit > defaultChunkSize {
+		limit = defaultChunkSize
+	}
+
+	ctx = models.WithBackground(ctx)
+	ctx = models.WithPriority(ctx, models.PriorityBackground)
+	ctx = models.WithTrackID(ctx, trackID)
+
+	s.diagMu.RLock()
+	diag := s.diagnostics
+	s.diagMu.RUnlock()
+	if diag != nil {
+		diag.RecordBackgroundRead()
+	}
+
+	track, err := s.client.ResolveTrack(ctx, trackID)
+	if err != nil || track == nil {
+		return nil, fmt.Errorf("track not found: %s", trackID)
+	}
+
+	var location *tg.InputDocumentFileLocation
+	if track.FileID != "" {
+		if decoded, err := telegram.DecodeFileID(track.FileID); err == nil {
+			location = &tg.InputDocumentFileLocation{
+				ID:            decoded.MediaID,
+				AccessHash:    decoded.AccessHash,
+				FileReference: decoded.FileReference,
+			}
+		}
+	}
+	if location == nil {
+		var docID int64
+		if strings.HasPrefix(track.ID, "doc_") {
+			docID, _ = strconv.ParseInt(strings.TrimPrefix(track.ID, "doc_"), 10, 64)
+		}
+		if docID == 0 {
+			docID = track.AccessHash
+		}
+		location = &tg.InputDocumentFileLocation{
+			ID:            docID,
+			AccessHash:    track.AccessHash,
+			FileReference: track.FileReference,
+		}
+	}
+
+	// Direct chunk download without prefetch or prefetchCache mutation
+	return s.downloadChunk(ctx, track, location, 0, limit)
+}
+
 // ReadChunk reads up to limit bytes starting at offset for trackID directly from Telegram/cache.
 func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, limit int) ([]byte, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
+
+	readStart := time.Now()
+	isBg := IsBackgroundContext(ctx)
+	if isBg {
+		s.diagMu.RLock()
+		diag := s.diagnostics
+		s.diagMu.RUnlock()
+		if diag != nil {
+			diag.RecordBackgroundRead()
+		}
+	}
+	ctx = WithTrackID(ctx, trackID)
+
 	track, err := s.client.ResolveTrack(ctx, trackID)
 	if err != nil || track == nil {
 		return nil, fmt.Errorf("track not found: %s", trackID)
@@ -135,6 +345,14 @@ func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, 
 		}
 
 		chunk, found := s.prefetchCache.Get(track.ID, chunkOffset, currentLimit)
+		if !isBg {
+			s.diagMu.RLock()
+			diag := s.diagnostics
+			s.diagMu.RUnlock()
+			if diag != nil {
+				diag.RecordCacheAccess(track.ID, found)
+			}
+		}
 		if !found {
 			var err error
 			chunk, err = s.downloadChunk(ctx, track, location, chunkOffset, currentLimit)
@@ -194,12 +412,25 @@ func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, 
 		}
 	}
 
+	readDuration := time.Since(readStart)
+	if !isBg {
+		s.diagMu.RLock()
+		diag := s.diagnostics
+		s.diagMu.RUnlock()
+		if diag != nil {
+			diag.RecordRead(trackID, limit, readDuration, len(result))
+		}
+	}
+
 	return result, nil
 }
 
 
 // ServeStream handles GET and HEAD /stream/:id.
 func (s *Streamer) ServeStream(w http.ResponseWriter, r *http.Request, trackID string) {
+	s.StartSession(trackID)
+	defer s.ReleaseSession(trackID)
+
 	ctx := r.Context()
 
 	track, err := s.client.ResolveTrack(ctx, trackID)

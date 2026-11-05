@@ -628,9 +628,12 @@ func TestStreamXArtworkResolution(t *testing.T) {
 		t.Errorf("expected album to fall back to 'https://example.com/queen.jpg', got '%s'", art)
 	}
 
-	// 5. artistArtworkURL should fall back to first track's HTTPS artwork
-	if art := srv.artistArtworkURL(ctx, "Queen", ""); art != "https://example.com/queen.jpg" {
-		t.Errorf("expected artist to fall back to 'https://example.com/queen.jpg', got '%s'", art)
+	// 5. artistArtworkURL should NOT reuse the first track's cover as an artist photo (Prompt 4 requirement)
+	if art := srv.artistArtworkURL(ctx, "Queen", ""); art != "" {
+		t.Errorf("expected artist art without verified photo to be empty, got '%s'", art)
+	}
+	if art := srv.artistArtworkURL(ctx, "Queen", "https://example.com/queen_artist.jpg"); art != "https://example.com/queen_artist.jpg" {
+		t.Errorf("expected explicit artist art to be preserved, got '%s'", art)
 	}
 
 	// 6. Home endpoint returns topic playlist with valid HTTPS thumbnail

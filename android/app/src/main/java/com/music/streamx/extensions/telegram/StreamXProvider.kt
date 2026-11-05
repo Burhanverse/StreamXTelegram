@@ -280,10 +280,19 @@ class StreamXProvider : ContentProvider() {
         }
 
         val segments = uri.pathSegments
-        if (segments.size < 2 || segments[0] != "track") {
+        if (segments.size < 2 || (segments[0] != "track" && segments[0] != "art")) {
             throw FileNotFoundException("Unsupported URI path: ${uri.path}")
         }
         val trackId = segments[1]
+
+        if (segments[0] == "art") {
+            val coverFile = java.io.File(ctx.filesDir, "covers/$trackId.jpg")
+            if (coverFile.exists() && coverFile.length() > 0) {
+                return ParcelFileDescriptor.open(coverFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            }
+            throw FileNotFoundException("Cover art not found for track: $trackId")
+        }
+
         LogBuffer.add("STREAM", "openFile: trackId=$trackId caller=$callerPkg")
 
         ensureEngineStarted()
@@ -295,6 +304,17 @@ class StreamXProvider : ContentProvider() {
 
         val storageManager = ctx.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
             ?: throw FileNotFoundException("StorageManager unavailable")
+
+        val handle = try {
+            Engine.openStream(trackId)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open engine stream session for track $trackId: ${e.message}")
+            throw FileNotFoundException("Failed to open stream session: ${e.message}")
+        }
+
+        // Dedicated HandlerThread per open stream session so preloaded next tracks cannot block current playback
+        val streamThread = HandlerThread("StreamProxy-$trackId-$handle", Process.THREAD_PRIORITY_AUDIO).apply { start() }
+        val streamHandler = Handler(streamThread.looper)
 
         WakeLockManager.acquire(ctx, "stream-$trackId")
 
@@ -308,7 +328,7 @@ class StreamXProvider : ContentProvider() {
                         return 0
                     }
                     return try {
-                        val chunk = Engine.readTrackChunk(trackId, offset, size.toLong())
+                        val chunk = Engine.readStream(handle, offset, size.toLong())
                         if (chunk == null || chunk.isEmpty()) {
                             0
                         } else {
@@ -317,17 +337,23 @@ class StreamXProvider : ContentProvider() {
                             toCopy
                         }
                     } catch (e: Exception) {
-                        Log.w(TAG, "Proxy read error for track $trackId at offset $offset: ${e.message}")
+                        Log.w(TAG, "Proxy read error for track $trackId (handle $handle) at offset $offset: ${e.message}")
                         throw ErrnoException("onRead", OsConstants.EIO)
                     }
                 }
 
                 override fun onRelease() {
-                    Log.d(TAG, "Proxy descriptor released for track $trackId")
+                    Log.d(TAG, "Proxy descriptor released for track $trackId (handle $handle)")
+                    try {
+                        Engine.closeStream(handle)
+                    } catch (_: Throwable) {}
+                    try {
+                        streamThread.quitSafely()
+                    } catch (_: Throwable) {}
                     WakeLockManager.release("stream-$trackId")
                 }
             },
-            proxyHandler
+            streamHandler
         )
     }
 

@@ -42,14 +42,15 @@ type Server struct {
 
 // Config specifies server configuration options.
 type Config struct {
-	Token      string
-	Port       int
-	Client     telegram.Client
-	DB         *database.DB
-	ChatID     int64
-	ArtworkDir string
-	Enrichment *services.EnrichmentService
-	Catchup    *telegram.CatchupService
+	Token       string
+	Port        int
+	Client      telegram.Client
+	DB          *database.DB
+	ChatID      int64
+	ArtworkDir  string
+	Enrichment  *services.EnrichmentService
+	Catchup     *telegram.CatchupService
+	Diagnostics *stream.StreamDiagnostics
 }
 
 // New creates and configures a new loopback server bound to 127.0.0.1:<port>.
@@ -89,6 +90,9 @@ func New(cfg Config) (*Server, error) {
 		enrichment: cfg.Enrichment,
 		catchup:    cfg.Catchup,
 		started:    time.Now(),
+	}
+	if cfg.Diagnostics != nil {
+		s.streamer.SetDiagnostics(cfg.Diagnostics)
 	}
 
 	mux := http.NewServeMux()
