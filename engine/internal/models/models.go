@@ -3,6 +3,8 @@ package models
 import (
 	"context"
 	"time"
+
+	"musix/engine/internal/config"
 )
 
 type ContextKey string
@@ -70,8 +72,15 @@ type Track struct {
 	ID          string    `json:"id"`
 	Title       string    `json:"title"`
 	Artist      string    `json:"artist"`
+	Artists     []string  `json:"artists,omitempty"`
 	Album       string    `json:"album"`
+	AlbumArtist string    `json:"album_artist,omitempty"`
+	TrackNumber int       `json:"track_number,omitempty"`
+	DiscNumber  int       `json:"disc_number,omitempty"`
+	Genre       string    `json:"genre,omitempty"`
+	Composer    string    `json:"composer,omitempty"`
 	DurationSec int       `json:"duration_sec"`
+	SampleRate  int       `json:"sample_rate,omitempty"`
 	MimeType    string    `json:"mime_type"`
 	FileSize    int64     `json:"file_size"`
 	FileName    string    `json:"file_name"`
@@ -79,8 +88,8 @@ type Track struct {
 
 	// Enrichment and Deduplication metadata
 	Fingerprint  string    `json:"fingerprint,omitempty"`
+	ThumbnailURL string    `json:"thumbnail_url,omitempty"`
 	CoverURL     string    `json:"cover_url,omitempty"`
-	ThumbURL     string    `json:"thumb_url,omitempty"`
 	Lyrics       string    `json:"lyrics,omitempty"`
 	SyncedLyrics string    `json:"synced_lyrics,omitempty"`
 	Year         int       `json:"year,omitempty"`
@@ -158,21 +167,22 @@ type BackupRecord struct {
 
 // Artist represents an aggregated artist entity.
 type Artist struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	TrackCount int      `json:"track_count"`
-	Albums     []string `json:"albums,omitempty"`
-	ThumbURL   string   `json:"thumb_url,omitempty"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	TrackCount   int      `json:"track_count"`
+	Albums       []string `json:"albums,omitempty"`
+	ThumbnailURL string   `json:"thumbnail_url,omitempty"`
 }
 
 // Album represents an aggregated album entity.
 type Album struct {
-	ID         string `json:"id"`
-	Title      string `json:"title"`
-	Artist     string `json:"artist"`
-	Year       int    `json:"year"`
-	TrackCount int    `json:"track_count"`
-	CoverURL   string `json:"cover_url,omitempty"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Artist       string `json:"artist"`
+	Year         int    `json:"year"`
+	TrackCount   int    `json:"track_count"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+	CoverURL     string `json:"cover_url,omitempty"`
 }
 
 // WorkerLocation holds per-bot session-specific access hash & file reference for a message.
@@ -197,19 +207,5 @@ type SyncState struct {
 }
 
 // Config represents runtime configuration passed from Android.
-// Note: Tokens and secrets must never be exported to the backed-up database.
-type Config struct {
-	ApiID         int      `json:"api_id"`
-	ApiHash       string   `json:"api_hash"`
-	BotToken      string   `json:"bot_token"`                  // Primary bot token
-	WorkerTokens  []string `json:"worker_tokens"`              // N-1 worker bot tokens
-	BotTokens     []string `json:"bot_tokens,omitempty"`       // Raw tokens list from Android
-	WorkerCount   int      `json:"worker_count"`               // Total bot pool size (default: 3)
-	ChatID        int64    `json:"chat_id"`                    // Target music group / channel
-	SystemTopicID int32    `json:"system_topic_id"`            // Topic ID for DB backup & sync
-	FilesDir      string   `json:"files_dir"`
-	CacheDir      string   `json:"cache_dir"`
-	AuthToken     string   `json:"auth_token,omitempty"`
-	Debug         bool     `json:"debug,omitempty"`
-}
+type Config = config.Config
 

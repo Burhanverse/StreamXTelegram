@@ -31,6 +31,13 @@ var (
 	reTrackPrefix     = regexp.MustCompile(`^(?:[0-9]{1,2}[.\-_]+|[0-9]{2}\s+)`)
 	reChannel         = regexp.MustCompile(`(?i)@[\w_]+`)
 	reSpaces          = regexp.MustCompile(`\s+`)
+
+	// Teleplayer-verified regex sanitizers
+	reTeleplayerTrackNum1 = regexp.MustCompile(`^\s*\d{1,3}\s*[.\-)]\s*`)
+	reTeleplayerTrackNum2 = regexp.MustCompile(`^\s*\d+\s*[|/]\s*\d+\s*-\s*`)
+	reTeleplayerFormat    = regexp.MustCompile(`(?i)\s*[\[(](?:flac|mp3|m4a|aac|wav|alac|hi-?res|lossless|\d+\s*kbps)[\])]`)
+	reTeleplayerNoise     = regexp.MustCompile(`(?i)\s*[\[(](?:explicit|clean|official|lyric|audio|video|remaster)[^\])]*[\])]`)
+	reTeleplayerArtist    = regexp.MustCompile(`(?i)\s*(?:,|&|\bfeat\.?\s|\bft\.?\s)\s*`)
 )
 
 // StructuredMetadata contains fully normalized, script-aware metadata extracted from Indian music uploads.
@@ -187,7 +194,13 @@ func StripNoise(text string) string {
 	// 10. Remove telegram channel handles (@channel_name)
 	s = reChannel.ReplaceAllString(s, " ")
 
-	// 11. Normalize spaces and strip dangling punctuation
+	// 11. Teleplayer track number, format badge, and feature/noise descriptors
+	s = reTeleplayerTrackNum1.ReplaceAllString(s, "")
+	s = reTeleplayerTrackNum2.ReplaceAllString(s, "")
+	s = reTeleplayerFormat.ReplaceAllString(s, " ")
+	s = reTeleplayerNoise.ReplaceAllString(s, " ")
+
+	// 12. Normalize spaces and strip dangling punctuation
 	s = reSpaces.ReplaceAllString(s, " ")
 	s = strings.TrimSpace(s)
 	s = reTrailingPunct.ReplaceAllString(s, "")

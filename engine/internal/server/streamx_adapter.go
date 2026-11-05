@@ -12,9 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"musix/engine/internal/logger"
 	"musix/engine/internal/metadata"
 	"musix/engine/internal/models"
 )
+
+var logAdapter = logger.New("streamx_adapter")
 
 // registerStreamXRoutes mounts the StreamX extension JSON adapter endpoints.
 func (s *Server) registerStreamXRoutes(mux *http.ServeMux) {
@@ -60,10 +63,44 @@ func formatTopicSubtitle(trackCount int) string {
 	return fmt.Sprintf("%d tracks", trackCount)
 }
 
+func (s *Server) isContentArtValid(contentURL string) bool {
+	if !strings.HasPrefix(contentURL, "content://com.music.streamx.extensions.telegram.source/art/") {
+		return false
+	}
+	trackID := strings.TrimPrefix(contentURL, "content://com.music.streamx.extensions.telegram.source/art/")
+	if s.artworkDir == "" || trackID == "" {
+		return false
+	}
+	artFile := filepath.Join(s.artworkDir, trackID+".jpg")
+	fi, err := os.Stat(artFile)
+	return err == nil && fi.Size() > 0
+}
+
 func (s *Server) formatThumbnailURL(rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
-	if strings.HasPrefix(rawURL, "https://") || strings.HasPrefix(rawURL, "content://") {
+	if strings.HasPrefix(rawURL, "https://") && !strings.Contains(rawURL, "local.burhanverse.eu.org") {
 		return rawURL
+	}
+	if strings.HasPrefix(rawURL, "https://local.burhanverse.eu.org") {
+		if s.httpsPort > 0 {
+			parts := strings.Split(rawURL, "/artwork/")
+			if len(parts) == 2 {
+				trackFile := strings.Split(parts[1], "?")[0]
+				trackID := strings.TrimSuffix(trackFile, ".jpg")
+				return fmt.Sprintf("https://local.burhanverse.eu.org:%d/artwork/%s.jpg?token=%s", s.httpsPort, trackID, s.token)
+			}
+		}
+		return rawURL
+	}
+	if strings.HasPrefix(rawURL, "content://com.music.streamx.extensions.telegram.source/art/") {
+		trackID := strings.TrimPrefix(rawURL, "content://com.music.streamx.extensions.telegram.source/art/")
+		if s.httpsPort > 0 {
+			return fmt.Sprintf("https://local.burhanverse.eu.org:%d/artwork/%s.jpg?token=%s", s.httpsPort, trackID, s.token)
+		}
+		if s.isContentArtValid(rawURL) {
+			return rawURL
+		}
+		return ""
 	}
 	return ""
 }
@@ -72,32 +109,85 @@ func (s *Server) trackArtworkURL(tr *models.Track) string {
 	if tr == nil {
 		return ""
 	}
-	// Source order: (a) embedded art from local file served through content:// provider first
+	thumbURL := strings.TrimSpace(tr.ThumbnailURL)
+	if thumbURL == "" {
+		thumbURL = strings.TrimSpace(tr.CoverURL)
+	}
+	if strings.HasPrefix(thumbURL, "https://") && !strings.Contains(thumbURL, "local.burhanverse.eu.org") {
+		return thumbURL
+	}
 	if s.artworkDir != "" {
 		artFile := filepath.Join(s.artworkDir, tr.ID+".jpg")
 		if fi, err := os.Stat(artFile); err == nil && fi.Size() > 0 {
+			if s.httpsPort > 0 {
+				return fmt.Sprintf("https://local.burhanverse.eu.org:%d/artwork/%s.jpg?token=%s", s.httpsPort, tr.ID, s.token)
+			}
 			return fmt.Sprintf("content://com.music.streamx.extensions.telegram.source/art/%s", tr.ID)
 		}
 	}
-	thumbURL := strings.TrimSpace(tr.CoverURL)
-	if thumbURL == "" && tr.ThumbURL != "" {
-		thumbURL = strings.TrimSpace(tr.ThumbURL)
-	}
-	if strings.HasPrefix(thumbURL, "https://") || strings.HasPrefix(thumbURL, "content://") {
-		return thumbURL
-	}
-	if s.enrichment != nil {
-		if cached := s.enrichment.GetCachedCover(tr.Title, tr.Artist); cached != "" {
-			return cached
+	if strings.HasPrefix(thumbURL, "content://com.music.streamx.extensions.telegram.source/art/") {
+		trackID := strings.TrimPrefix(thumbURL, "content://com.music.streamx.extensions.telegram.source/art/")
+		if s.httpsPort > 0 {
+			return fmt.Sprintf("https://local.burhanverse.eu.org:%d/artwork/%s.jpg?token=%s", s.httpsPort, trackID, s.token)
 		}
+		if s.isContentArtValid(thumbURL) {
+			return thumbURL
+		}
+	}
+	if strings.HasPrefix(thumbURL, "https://local.burhanverse.eu.org") && s.httpsPort > 0 {
+		return fmt.Sprintf("https://local.burhanverse.eu.org:%d/artwork/%s.jpg?token=%s", s.httpsPort, tr.ID, s.token)
 	}
 	return ""
 }
 
+type trackArtworkStats struct {
+	contentCount int
+	httpsCount   int
+	noneNoFile   int
+	noneEmpty    int
+}
+
+func (s *Server) logTrackArtworkStats(endpoint string, tracks []*models.Track) {
+	var st trackArtworkStats
+	for _, tr := range tracks {
+		if tr == nil {
+			st.noneEmpty++
+			continue
+		}
+		art := s.trackArtworkURL(tr)
+		if strings.HasPrefix(art, "content://") {
+			st.contentCount++
+		} else if strings.HasPrefix(art, "https://") {
+			st.httpsCount++
+		} else {
+			if s.artworkDir != "" {
+				artPath := filepath.Join(s.artworkDir, tr.ID+".jpg")
+				if _, err := os.Stat(artPath); err != nil {
+					if tr.CoverURL != "" || tr.ThumbnailURL != "" {
+						st.noneNoFile++
+					} else {
+						st.noneEmpty++
+					}
+				} else {
+					st.noneEmpty++
+				}
+			} else {
+				if tr.CoverURL != "" || tr.ThumbnailURL != "" {
+					st.noneNoFile++
+				} else {
+					st.noneEmpty++
+				}
+			}
+		}
+	}
+	noneTotal := st.noneNoFile + st.noneEmpty
+	logAdapter.Infof("[%s] Response thumbnail stats for %d tracks: content://=%d, https://=%d, none=%d (reasons: no file on disk=%d, empty CoverURL=%d)",
+		endpoint, len(tracks), st.contentCount, st.httpsCount, noneTotal, st.noneNoFile, st.noneEmpty)
+}
+
 func (s *Server) topicArtworkURL(ctx context.Context, topicID int32, explicitArt string) string {
-	explicitArt = strings.TrimSpace(explicitArt)
-	if strings.HasPrefix(explicitArt, "https://") || strings.HasPrefix(explicitArt, "content://") {
-		return explicitArt
+	if validArt := s.formatThumbnailURL(explicitArt); validArt != "" {
+		return validArt
 	}
 	if s.db != nil {
 		tracks, err := s.db.ListTracksByTopic(ctx, s.chatID, topicID, 0, 10)
@@ -113,9 +203,8 @@ func (s *Server) topicArtworkURL(ctx context.Context, topicID int32, explicitArt
 }
 
 func (s *Server) playlistArtworkURL(ctx context.Context, plID string, explicitArt string) string {
-	explicitArt = strings.TrimSpace(explicitArt)
-	if strings.HasPrefix(explicitArt, "https://") || strings.HasPrefix(explicitArt, "content://") {
-		return explicitArt
+	if validArt := s.formatThumbnailURL(explicitArt); validArt != "" {
+		return validArt
 	}
 	if s.db != nil {
 		tracks, err := s.db.GetPlaylistTracks(ctx, plID, 0, 10)
@@ -131,9 +220,8 @@ func (s *Server) playlistArtworkURL(ctx context.Context, plID string, explicitAr
 }
 
 func (s *Server) albumArtworkURL(ctx context.Context, albumTitle string, explicitCover string) string {
-	explicitCover = strings.TrimSpace(explicitCover)
-	if strings.HasPrefix(explicitCover, "https://") || strings.HasPrefix(explicitCover, "content://") {
-		return explicitCover
+	if validCover := s.formatThumbnailURL(explicitCover); validCover != "" {
+		return validCover
 	}
 	if s.db != nil {
 		tracks, err := s.db.GetAlbumTracks(ctx, albumTitle, 50)
@@ -162,7 +250,9 @@ func (s *Server) albumArtworkURL(ctx context.Context, albumTitle string, explici
 }
 
 func (s *Server) artistArtworkURL(ctx context.Context, artistName string, explicitThumb string) string {
-	explicitThumb = strings.TrimSpace(explicitThumb)
+	if validThumb := s.formatThumbnailURL(explicitThumb); validThumb != "" {
+		return validThumb
+	}
 	if strings.HasPrefix(explicitThumb, "https://") || strings.HasPrefix(explicitThumb, "content://") {
 		return explicitThumb
 	}
@@ -289,7 +379,7 @@ func (s *Server) handleStreamXBrowse(w http.ResponseWriter, r *http.Request) {
 				"id":            art.ID,
 				"title":         art.Name,
 				"subtitle":      fmt.Sprintf("%d tracks", art.TrackCount),
-				"thumbnail_url": s.artistArtworkURL(ctx, art.Name, art.ThumbURL),
+				"thumbnail_url": s.artistArtworkURL(ctx, art.Name, art.ThumbnailURL),
 			})
 		}
 		sections = append(sections, map[string]interface{}{
@@ -320,6 +410,8 @@ func (s *Server) handleStreamXBrowse(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	s.logTrackArtworkStats("browse", nil)
+
 	budgetResponseJSON(w, http.StatusOK, map[string]interface{}{
 		"account":  account,
 		"sections": sections,
@@ -337,6 +429,7 @@ func (s *Server) handleStreamXLibrary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.db == nil {
+		s.logTrackArtworkStats("library", nil)
 		budgetResponseJSON(w, http.StatusOK, map[string]interface{}{
 			"account":  account,
 			"sections": sections,
@@ -344,8 +437,10 @@ func (s *Server) handleStreamXLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var allTracks []*models.Track
 	// 1. Liked / All Songs section (consumed by StreamX ApkCatalogue to populate LibraryPage.likedSongs & librarySongs)
-	if allTracks, _, err := s.db.ListTracks(ctx, 0, 50); err == nil && len(allTracks) > 0 {
+	if allTracksList, _, err := s.db.ListTracks(ctx, 0, 50); err == nil && len(allTracksList) > 0 {
+		allTracks = allTracksList
 		trackItems := make([]map[string]interface{}, 0, len(allTracks))
 		for _, tr := range allTracks {
 			trackItems = append(trackItems, s.trackToStreamXItem(tr))
@@ -405,7 +500,7 @@ func (s *Server) handleStreamXLibrary(w http.ResponseWriter, r *http.Request) {
 				"id":            art.ID,
 				"title":         art.Name,
 				"subtitle":      fmt.Sprintf("%d tracks", art.TrackCount),
-				"thumbnail_url": s.artistArtworkURL(ctx, art.Name, art.ThumbURL),
+				"thumbnail_url": s.artistArtworkURL(ctx, art.Name, art.ThumbnailURL),
 			})
 		}
 		sections = append(sections, map[string]interface{}{
@@ -414,6 +509,8 @@ func (s *Server) handleStreamXLibrary(w http.ResponseWriter, r *http.Request) {
 			"items":    items,
 		})
 	}
+
+	s.logTrackArtworkStats("library", allTracks)
 
 	budgetResponseJSON(w, http.StatusOK, map[string]interface{}{
 		"account":  account,
@@ -483,6 +580,7 @@ func (s *Server) handleStreamXDetail(w http.ResponseWriter, r *http.Request) {
 		var items []map[string]interface{}
 		var title, subtitle, thumbURL string
 		var nextOffset interface{} = nil
+		var tracks []*models.Track
 
 		if err == nil && topicID > 0 {
 			top, _ := s.db.GetTopic(ctx, s.chatID, int32(topicID))
@@ -492,11 +590,12 @@ func (s *Server) handleStreamXDetail(w http.ResponseWriter, r *http.Request) {
 				thumbURL = s.formatThumbnailURL(top.ArtworkURL)
 			}
 			title = formatTopicPlaylistTitle(rawName, int32(topicID))
-			tracks, err := s.db.ListTracksByTopic(ctx, s.chatID, int32(topicID), offset, limit)
+			trList, err := s.db.ListTracksByTopic(ctx, s.chatID, int32(topicID), offset, limit)
 			if err != nil {
 				respondJSON(w, http.StatusInternalServerError, map[string]interface{}{"error": err.Error()})
 				return
 			}
+			tracks = trList
 			subtitle = formatTopicSubtitle(len(tracks))
 			items = make([]map[string]interface{}, 0, len(tracks))
 			for _, tr := range tracks {
@@ -518,11 +617,12 @@ func (s *Server) handleStreamXDetail(w http.ResponseWriter, r *http.Request) {
 			title = pl.Title
 			subtitle = pl.Subtitle
 			thumbURL = s.formatThumbnailURL(pl.ArtworkURL)
-			tracks, err := s.db.GetPlaylistTracks(ctx, id, offset, limit)
+			trList, err := s.db.GetPlaylistTracks(ctx, id, offset, limit)
 			if err != nil {
 				respondJSON(w, http.StatusInternalServerError, map[string]interface{}{"error": err.Error()})
 				return
 			}
+			tracks = trList
 			items = make([]map[string]interface{}, 0, len(tracks))
 			for _, tr := range tracks {
 				items = append(items, s.trackToStreamXItem(tr))
@@ -535,6 +635,7 @@ func (s *Server) handleStreamXDetail(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		s.logTrackArtworkStats(fmt.Sprintf("detail:playlist:%s", id), tracks)
 		budgetResponseJSON(w, http.StatusOK, map[string]interface{}{
 			"title":         title,
 			"subtitle":      subtitle,
@@ -561,6 +662,7 @@ func (s *Server) handleStreamXDetail(w http.ResponseWriter, r *http.Request) {
 				thumbURL = s.trackArtworkURL(tr)
 			}
 		}
+		s.logTrackArtworkStats(fmt.Sprintf("detail:album:%s", id), tracks)
 		budgetResponseJSON(w, http.StatusOK, map[string]interface{}{
 			"title":         id,
 			"subtitle":      artist,
@@ -584,6 +686,7 @@ func (s *Server) handleStreamXDetail(w http.ResponseWriter, r *http.Request) {
 				thumbURL = s.trackArtworkURL(tr)
 			}
 		}
+		s.logTrackArtworkStats(fmt.Sprintf("detail:artist:%s", id), tracks)
 		budgetResponseJSON(w, http.StatusOK, map[string]interface{}{
 			"title":         id,
 			"subtitle":      "Artist",
@@ -648,7 +751,7 @@ func (s *Server) handleStreamXDetail(w http.ResponseWriter, r *http.Request) {
 					"id":            art.ID,
 					"title":         art.Name,
 					"subtitle":      fmt.Sprintf("%d tracks", art.TrackCount),
-					"thumbnail_url": s.artistArtworkURL(ctx, art.Name, art.ThumbURL),
+					"thumbnail_url": s.artistArtworkURL(ctx, art.Name, art.ThumbnailURL),
 				})
 			}
 		} else if id == "liked" || id == "daily" {
@@ -670,6 +773,7 @@ func (s *Server) handleStreamXDetail(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		s.logTrackArtworkStats(fmt.Sprintf("detail:collection:%s", id), tracks)
 		budgetResponseJSON(w, http.StatusOK, map[string]interface{}{
 			"title":         title,
 			"subtitle":      "",

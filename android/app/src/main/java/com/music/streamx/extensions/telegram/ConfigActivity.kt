@@ -1,14 +1,17 @@
 package com.music.streamx.extensions.telegram
 
-import android.content.ClipData
-import android.content.ClipboardManager
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
@@ -25,7 +28,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.File
 
 /**
  * ConfigActivity provides the primary dashboard for the StreamX Telegram extension,
@@ -43,6 +45,36 @@ class ConfigActivity : AppCompatActivity() {
     private val wakeLockListener: (Boolean) -> Unit = { isHeld ->
         runOnUiThread {
             updateWakeLockUI(isHeld)
+        }
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            BackgroundWorkerService.start(this)
+        } else {
+            Toast.makeText(this, "Notification permission is required for background worker", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun startWorkerWithPermissionCheck() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+                BackgroundWorkerService.start(this)
+            } else {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        } else {
+            BackgroundWorkerService.start(this)
+        }
+    }
+
+    private fun toggleWorkerWithPermissionCheck() {
+        if (BackgroundWorkerService.isRunning()) {
+            BackgroundWorkerService.stop(this)
+        } else {
+            startWorkerWithPermissionCheck()
         }
     }
 
@@ -115,19 +147,21 @@ class ConfigActivity : AppCompatActivity() {
 
         // Setup WakeLock toggle button
         binding.wakeLockToggleBtn.setOnClickListener {
-            StreamXWakeLockService.toggle(this)
+            toggleWorkerWithPermissionCheck()
         }
-        StreamXWakeLockService.addListener(wakeLockListener)
+        BackgroundWorkerService.addListener(wakeLockListener)
 
         // Auto-restore WakeLock if enabled previously
-        if (StreamXWakeLockService.isPersistedEnabled(this) && !StreamXWakeLockService.isRunning()) {
-            StreamXWakeLockService.start(this)
+        if (BackgroundWorkerService.isPersistedEnabled(this) && !BackgroundWorkerService.isRunning()) {
+            startWorkerWithPermissionCheck()
         }
 
         // Check if opened from intent with popup request
         if (intent.getBooleanExtra("OPEN_POPUP", false)) {
             showSettingsBottomSheet()
         }
+
+        binding.footerSubtitle.text = "v${BuildConfig.VERSION_NAME} • On-Device Engine"
 
         // Start diagnostic status polling loop
         startEngineMonitoring()
@@ -139,7 +173,7 @@ class ConfigActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        StreamXWakeLockService.removeListener(wakeLockListener)
+        BackgroundWorkerService.removeListener(wakeLockListener)
         binding.terminalView.detach()
         super.onDestroy()
     }
@@ -400,61 +434,15 @@ class ConfigActivity : AppCompatActivity() {
         val chatId = KeyStoreManager.get(this, "chat_id") ?: prefs.getString("chat_id", "") ?: ""
         val botTokens = KeyStoreManager.get(this, "bot_tokens") ?: prefs.getString("bot_tokens", "") ?: ""
         val systemTopic = KeyStoreManager.get(this, "system_topic_id") ?: prefs.getString("system_topic_id", "1") ?: "1"
-        val debugEnabled = prefs.getBoolean("debug_diagnostics", false)
 
         sheetBinding.apiIdInput.setText(apiId)
         sheetBinding.apiHashInput.setText(apiHash)
         sheetBinding.chatIdInput.setText(chatId)
         sheetBinding.botTokensInput.setText(botTokens)
         sheetBinding.systemTopicInput.setText(systemTopic)
-        sheetBinding.debugDiagnosticsSwitch.isChecked = debugEnabled
 
         sheetBinding.backBtn.setOnClickListener {
             sheetDialog.dismiss()
-        }
-
-        sheetBinding.copyDiagnosticsBtn.setOnClickListener {
-            try {
-                var diagText = ""
-                try {
-                    diagText = Engine.getDiagnosticsClipboard(200, 50)
-                } catch (_: Throwable) {}
-
-                if (diagText.isBlank() || (diagText.contains("(no streaming stats recorded yet)") && diagText.contains("(no enrichment decisions recorded yet)"))) {
-                    // Fallback to local files if engine method returned empty
-                    val filesDir = applicationContext.filesDir
-                    val statsFile = File(filesDir, "logs/stream_stats.log")
-                    val enrichFile = File(filesDir, "logs/enrich.jsonl")
-
-                    val statsLines = if (statsFile.exists()) statsFile.readLines().takeLast(200) else emptyList()
-                    val enrichLines = if (enrichFile.exists()) enrichFile.readLines().takeLast(50) else emptyList()
-
-                    val sb = StringBuilder()
-                    sb.append("=== STREAMING STATS (Last ${statsLines.size} lines) ===\n")
-                    if (statsLines.isNotEmpty()) {
-                        statsLines.forEach { sb.append(it).append("\n") }
-                    } else {
-                        sb.append("(no streaming stats recorded yet)\n")
-                    }
-
-                    sb.append("\n=== ENRICHMENT DECISIONS (Last ${enrichLines.size} lines) ===\n")
-                    if (enrichLines.isNotEmpty()) {
-                        enrichLines.forEach { sb.append(it).append("\n") }
-                    } else {
-                        sb.append("(no enrichment decisions recorded yet)\n")
-                    }
-                    diagText = sb.toString()
-                }
-
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val clip = ClipData.newPlainText("StreamX Diagnostics", diagText)
-                clipboard.setPrimaryClip(clip)
-
-                Toast.makeText(this, "Copied diagnostics report to clipboard", Toast.LENGTH_SHORT).show()
-                LogBuffer.add("DIAG", "Diagnostics copied to clipboard.")
-            } catch (e: Exception) {
-                Toast.makeText(this, "Failed to copy diagnostics: ${e.message}", Toast.LENGTH_SHORT).show()
-            }
         }
 
         sheetBinding.clearBtn.setOnClickListener {
@@ -463,7 +451,6 @@ class ConfigActivity : AppCompatActivity() {
             sheetBinding.chatIdInput.setText("")
             sheetBinding.botTokensInput.setText("")
             sheetBinding.systemTopicInput.setText("1")
-            sheetBinding.debugDiagnosticsSwitch.isChecked = false
 
             KeyStoreManager.remove(this, "api_id")
             KeyStoreManager.remove(this, "api_hash")
@@ -482,7 +469,6 @@ class ConfigActivity : AppCompatActivity() {
             val newChatId = sheetBinding.chatIdInput.text.toString().trim()
             val newBotTokens = sheetBinding.botTokensInput.text.toString().trim()
             val newTopicId = sheetBinding.systemTopicInput.text.toString().trim().ifEmpty { "1" }
-            val newDebug = sheetBinding.debugDiagnosticsSwitch.isChecked
 
             KeyStoreManager.put(this, "api_id", newApiId)
             KeyStoreManager.put(this, "api_hash", newApiHash)
@@ -496,10 +482,9 @@ class ConfigActivity : AppCompatActivity() {
                 .putString("chat_id", newChatId)
                 .putString("bot_tokens", newBotTokens)
                 .putString("system_topic_id", newTopicId)
-                .putBoolean("debug_diagnostics", newDebug)
                 .apply()
 
-            LogBuffer.add("CONFIG", "Credentials saved and encrypted in Android KeyStore (debug=$newDebug).")
+            LogBuffer.add("CONFIG", "Credentials saved and encrypted in Android KeyStore.")
             Toast.makeText(this, "Credentials saved successfully", Toast.LENGTH_SHORT).show()
 
             sheetDialog.dismiss()
@@ -542,7 +527,6 @@ class ConfigActivity : AppCompatActivity() {
             put("worker_tokens", JSONArray(workerTokens))
             put("bot_tokens", JSONArray(tokens))
             put("auth_token", "streamx-secret-session-token")
-            put("debug", prefs.getBoolean("debug_diagnostics", false))
         }
         return json.toString()
     }

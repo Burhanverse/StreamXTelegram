@@ -49,7 +49,7 @@ func setupAPITestServer(t *testing.T) (*Server, *database.DB) {
 			FileName:     "time.flac",
 			CreatedAt:    time.Now().Add(-2 * time.Hour),
 			CoverURL:     "https://example.com/dark_side.jpg",
-			ThumbURL:     "https://example.com/dark_side_thumb.jpg",
+			ThumbnailURL: "https://example.com/dark_side_thumb.jpg",
 			Lyrics:       "Ticking away the moments that make up a dull day",
 			SyncedLyrics: "[00:10.00] Ticking away the moments",
 			Year:         1973,

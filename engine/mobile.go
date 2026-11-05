@@ -7,16 +7,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"musix/engine/internal/database"
 	"musix/engine/internal/logger"
+	"musix/engine/internal/metadata"
 	"musix/engine/internal/models"
 	"musix/engine/internal/server"
 	"musix/engine/internal/services"
-	"musix/engine/internal/stream"
 	"musix/engine/internal/telegram"
 )
 
@@ -28,8 +27,6 @@ var (
 	globalCatchup     *telegram.CatchupService
 	globalBackup      *telegram.BackupService
 	globalWatcher     *telegram.Watcher
-	globalDiagnostics *stream.StreamDiagnostics
-	globalFilesDir    string
 	globalCallback    EventCallback
 	globalCallbackMu  sync.RWMutex
 	globalMu          sync.Mutex
@@ -84,10 +81,11 @@ func notifyLog(line string) {
 }
 
 
-// StartResult returns the loopback port and session security token.
+// StartResult returns the loopback ports and session security token.
 type StartResult struct {
-	Port  int
-	Token string
+	Port      int
+	HTTPSPort int
+	Token     string
 }
 
 // Start launches the engine, embedded database, MTProto pool, and loopback server.
@@ -97,8 +95,9 @@ func Start(filesDir, cacheDir, configJSON string) (*StartResult, error) {
 
 	if globalServer != nil {
 		return &StartResult{
-			Port:  globalServer.Port(),
-			Token: globalServer.Token(),
+			Port:      globalServer.Port(),
+			HTTPSPort: globalServer.HTTPSPort(),
+			Token:     globalServer.Token(),
 		}, nil
 	}
 
@@ -167,34 +166,30 @@ func Start(filesDir, cacheDir, configJSON string) (*StartResult, error) {
 
 	var artworkDir string
 	if filesDir != "" {
-		artworkDir = filepath.Join(filesDir, "artwork")
+		artworkDir = filepath.Join(filesDir, metadata.ArtworkDirName)
 		_ = os.MkdirAll(artworkDir, 0755)
 	}
-
-	globalFilesDir = filesDir
-	diag := stream.NewStreamDiagnostics(cfg.Debug, filesDir)
-	globalDiagnostics = diag
 
 	if client != nil && db != nil && globalEnrichment == nil {
 		globalEnrichment = services.NewEnrichmentService(db)
 	}
 	if globalEnrichment != nil {
-		globalEnrichment.SetDebug(cfg.Debug, filesDir)
 		if artworkDir != "" {
 			globalEnrichment.SetArtworkDir(artworkDir)
 		}
 	}
 
 	srv, err := server.New(server.Config{
-		Token:       cfg.AuthToken,
-		Port:        0,
-		Client:      client,
-		DB:          db,
-		ChatID:      cfg.ChatID,
-		ArtworkDir:  artworkDir,
-		Enrichment:  globalEnrichment,
-		Catchup:     globalCatchup,
-		Diagnostics: diag,
+		Token:      cfg.AuthToken,
+		Port:       0,
+		HTTPSPort:  0,
+		CertsDir:   filepath.Join(filesDir, "certs"),
+		Client:     client,
+		DB:         db,
+		ChatID:     cfg.ChatID,
+		ArtworkDir: artworkDir,
+		Enrichment: globalEnrichment,
+		Catchup:    globalCatchup,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to start server: %w", err)
@@ -212,8 +207,9 @@ func Start(filesDir, cacheDir, configJSON string) (*StartResult, error) {
 	globalServer = srv
 
 	return &StartResult{
-		Port:  srv.Port(),
-		Token: srv.Token(),
+		Port:      srv.Port(),
+		HTTPSPort: srv.HTTPSPort(),
+		Token:     srv.Token(),
 	}, nil
 }
 
@@ -244,8 +240,6 @@ func Stop() {
 	}
 	globalCatchup = nil
 	globalBackup = nil
-	globalDiagnostics = nil
-	globalFilesDir = ""
 
 	globalCallbackMu.Lock()
 	globalCallback = nil
@@ -277,6 +271,16 @@ func GetPort() int {
 	defer globalMu.Unlock()
 	if globalServer != nil {
 		return globalServer.Port()
+	}
+	return 0
+}
+
+// GetHTTPSPort returns the bound loopback HTTPS port, or 0 if inactive.
+func GetHTTPSPort() int {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+	if globalServer != nil {
+		return globalServer.HTTPSPort()
 	}
 	return 0
 }
@@ -368,140 +372,59 @@ func ReadTrackChunk(trackID string, offset int64, length int) ([]byte, error) {
 func StartStreamSession(trackID string) {
 	globalMu.Lock()
 	srv := globalServer
-	diag := globalDiagnostics
 	globalMu.Unlock()
 
 	if srv != nil && srv.Streamer() != nil {
 		srv.Streamer().StartSession(trackID)
-	} else if diag != nil {
-		diag.StartSession(trackID)
 	}
 }
 
-// ReleaseStreamSession concludes the playback session for trackID and outputs summary telemetry.
+// ReleaseStreamSession concludes the playback session for trackID.
 func ReleaseStreamSession(trackID string) {
 	globalMu.Lock()
 	srv := globalServer
-	diag := globalDiagnostics
 	globalMu.Unlock()
 
 	if srv != nil && srv.Streamer() != nil {
 		srv.Streamer().ReleaseSession(trackID)
-	} else if diag != nil {
-		diag.ReleaseSession(trackID)
 	}
 }
 
-// GetDiagnosticsClipboard returns the formatted diagnostic report: up to statsLimit stats lines
-// and up to enrichLimit enrichment decision lines.
+// SetScreenOn informs the engine whether the device screen is currently on/interactive.
+func SetScreenOn(on bool) {
+}
+
+// GetArtworkDirName returns the shared directory name for cover artwork ("artwork").
+func GetArtworkDirName() string {
+	return metadata.ArtworkDirName
+}
+
+// GetEnrichmentSummary returns the summary line with library counts:
+// [ENRICH_SUMMARY] total=%d embedded_ok=%d no_art=%d transient_fails=%d permanent_fails=%d online_matched=%d pending=%d
+func GetEnrichmentSummary() string {
+	globalMu.Lock()
+	db := globalDB
+	globalMu.Unlock()
+
+	if db == nil {
+		return "[ENRICH_SUMMARY] database not open"
+	}
+	return db.GetEnrichmentSummaryLine(context.Background())
+}
+
+// GetDiagnosticsClipboard returns the formatted diagnostic report.
 func GetDiagnosticsClipboard(statsLimit, enrichLimit int) string {
-	globalMu.Lock()
-	diag := globalDiagnostics
-	enrich := globalEnrichment
-	srv := globalServer
-	filesDir := globalFilesDir
-	globalMu.Unlock()
-
-	if statsLimit <= 0 {
-		statsLimit = 200
-	}
-	if enrichLimit <= 0 {
-		enrichLimit = 50
-	}
-
-	var statsLines []string
-	if diag != nil {
-		statsLines = diag.GetRecentStats(statsLimit)
-	} else if srv != nil && srv.Streamer() != nil && srv.Streamer().Diagnostics() != nil {
-		statsLines = srv.Streamer().Diagnostics().GetRecentStats(statsLimit)
-	}
-	if len(statsLines) == 0 && filesDir != "" {
-		statsPath := filepath.Join(filesDir, "logs", "stream_stats.log")
-		statsLines = readLastNLines(statsPath, statsLimit)
-	}
-
-	var enrichLines []string
-	if enrich != nil {
-		enrichLines = enrich.GetRecentEnrichmentLogs(enrichLimit)
-	}
-	if len(enrichLines) == 0 && filesDir != "" {
-		enrichPath := filepath.Join(filesDir, "logs", "enrich.jsonl")
-		enrichLines = readLastNLines(enrichPath, enrichLimit)
-	}
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("=== STREAMING STATS (Last %d lines) ===\n", len(statsLines)))
-	for _, l := range statsLines {
-		sb.WriteString(l)
-		sb.WriteString("\n")
-	}
-	if len(statsLines) == 0 {
-		sb.WriteString("(no streaming stats recorded yet)\n")
-	}
-
-	sb.WriteString(fmt.Sprintf("\n=== ENRICHMENT DECISIONS (Last %d lines) ===\n", len(enrichLines)))
-	for _, l := range enrichLines {
-		sb.WriteString(l)
-		sb.WriteString("\n")
-	}
-	if len(enrichLines) == 0 {
-		sb.WriteString("(no enrichment decisions recorded yet)\n")
-	}
-
-	return sb.String()
+	return GetEnrichmentSummary()
 }
 
-// GetStreamingStats returns the recent streaming stats lines joined by newlines.
+// GetStreamingStats returns the recent streaming stats lines.
 func GetStreamingStats(limit int) string {
-	globalMu.Lock()
-	diag := globalDiagnostics
-	filesDir := globalFilesDir
-	globalMu.Unlock()
-
-	if limit <= 0 {
-		limit = 200
-	}
-	var lines []string
-	if diag != nil {
-		lines = diag.GetRecentStats(limit)
-	}
-	if len(lines) == 0 && filesDir != "" {
-		lines = readLastNLines(filepath.Join(filesDir, "logs", "stream_stats.log"), limit)
-	}
-	return strings.Join(lines, "\n")
+	return ""
 }
 
-// GetEnrichmentLogs returns the recent enrichment decision JSON lines joined by newlines.
+// GetEnrichmentLogs returns the recent enrichment decision JSON lines.
 func GetEnrichmentLogs(limit int) string {
-	globalMu.Lock()
-	enrich := globalEnrichment
-	filesDir := globalFilesDir
-	globalMu.Unlock()
-
-	if limit <= 0 {
-		limit = 50
-	}
-	var lines []string
-	if enrich != nil {
-		lines = enrich.GetRecentEnrichmentLogs(limit)
-	}
-	if len(lines) == 0 && filesDir != "" {
-		lines = readLastNLines(filepath.Join(filesDir, "logs", "enrich.jsonl"), limit)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func readLastNLines(path string, n int) []string {
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) == 0 {
-		return nil
-	}
-	raw := strings.ReplaceAll(string(data), "\r\n", "\n")
-	lines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
-	if len(lines) <= n {
-		return lines
-	}
-	return lines[len(lines)-n:]
+	return ""
 }
 
 

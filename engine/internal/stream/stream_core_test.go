@@ -355,3 +355,60 @@ func TestPrompt2_NoPrefetchFromReadHeader(t *testing.T) {
 		t.Errorf("Expected exactly 1 download for ReadHeader, got %d", count)
 	}
 }
+
+// Task 7: Background caching prevents duplicate downloads in the same MB
+func TestBackgroundReadsCappedAtBlockSize(t *testing.T) {
+	fakeClient := newFakeTelegramClient()
+	track := &models.Track{
+		ID:          "track_bg_cache_test",
+		Title:       "FLAC Metadata Song",
+		FileSize:    10 * 1024 * 1024,
+		DurationSec: 300,
+	}
+	fakeClient.RegisterTrack(track)
+
+	streamer := NewStreamer(fakeClient)
+	ctx := models.WithBackground(context.Background())
+
+	// 1. Initial 256 KB block read (rangeReaderAt block size)
+	chunk1, err := streamer.ReadChunk(ctx, track.ID, 0, 256*1024)
+	if err != nil {
+		t.Fatalf("First ReadChunk (256 KB) failed: %v", err)
+	}
+	if len(chunk1) != 256*1024 {
+		t.Fatalf("Expected 256 KB chunk, got %d bytes", len(chunk1))
+	}
+
+	// 2. Subsequent 64 KB read within the same 256 KB block
+	chunk2, err := streamer.ReadChunk(ctx, track.ID, 64*1024, 64*1024)
+	if err != nil {
+		t.Fatalf("Second ReadChunk (64 KB) failed: %v", err)
+	}
+	if len(chunk2) != 64*1024 {
+		t.Fatalf("Expected 64 KB chunk, got %d bytes", len(chunk2))
+	}
+
+	// 3. Exactly 1 download request must have been issued for both reads within the same block
+	dlCount := atomic.LoadInt32(&fakeClient.downloadCount)
+	if dlCount != 1 {
+		t.Fatalf("Expected exactly 1 DownloadChunk call for reads in the same block, but got %d", dlCount)
+	}
+
+	// 4. Verify prefetch cache was NOT polluted
+	if _, inPlaybackCache := streamer.prefetchCache.Get(track.ID, 0, 64*1024); inPlaybackCache {
+		t.Errorf("Expected playback prefetch cache to NOT be polluted by background reads")
+	}
+
+	// 5. Verify data integrity
+	for i := 0; i < len(chunk1); i++ {
+		if chunk1[i] != byte(i%256) {
+			t.Fatalf("Mismatch in chunk1 byte %d: expected %d, got %d", i, byte(i%256), chunk1[i])
+		}
+	}
+	for i := 0; i < len(chunk2); i++ {
+		expected := byte((64*1024 + i) % 256)
+		if chunk2[i] != expected {
+			t.Fatalf("Mismatch in chunk2 byte %d: expected %d, got %d", i, expected, chunk2[i])
+		}
+	}
+}

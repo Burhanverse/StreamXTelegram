@@ -4,11 +4,14 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
         android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/Theme.StreamX.Telegram">
@@ -16,6 +19,8 @@
         <activity
             android:name="com.music.streamx.extensions.telegram.ConfigActivity"
             android:label="StreamX Telegram"
+            android:icon="@mipmap/ic_launcher"
+            android:roundIcon="@mipmap/ic_launcher_round"
             android:exported="true">
             <intent-filter>
                 <action android:name="com.music.streamx.action.EXTENSION" />
@@ -60,9 +65,14 @@
             android:foregroundServiceType="mediaPlayback" />
 
         <service
-            android:name="com.music.streamx.extensions.telegram.StreamXWakeLockService"
+            android:name="com.music.streamx.extensions.telegram.BackgroundWorkerService"
+            android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Long running background processing task similar to terminal operations." />
+        </service>
 
     </application>
 

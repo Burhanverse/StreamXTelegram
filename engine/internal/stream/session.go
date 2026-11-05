@@ -11,17 +11,9 @@ import (
 	"github.com/gotd/td/tg"
 	"golang.org/x/sync/singleflight"
 
+	"musix/engine/internal/config"
 	"musix/engine/internal/models"
 	"musix/engine/internal/telegram"
-)
-
-const (
-	initialSmallChunkSize = 256 * 1024 // 256 KB first chunk for instant TTFB
-	fullChunkSize         = 1024 * 1024 // 1 MB full chunk
-	defaultBitrateBps     = 32000       // ~256 kbps fallback audio bitrate (32 KB/s)
-	defaultReadAheadSec   = 25          // target read-ahead buffer in seconds
-	minReadAheadBytes     = 2 * 1024 * 1024 // at least 2 MB prefetch
-	maxReadAheadBytes     = 8 * 1024 * 1024 // at most 8 MB prefetch window
 )
 
 // StreamSession manages an open playback stream with singleflight deduplication,
@@ -85,7 +77,7 @@ func NewStreamSession(parentCtx context.Context, id int64, trackID string, strea
 	}
 
 	durationSec := track.DurationSec
-	var bitrate int64 = defaultBitrateBps
+	var bitrate int64 = config.DefaultBitrateBps
 	if durationSec > 0 && totalSize > 0 {
 		bitrate = totalSize / int64(durationSec)
 		if bitrate < 8000 {
@@ -121,7 +113,6 @@ func (s *StreamSession) Read(offset int64, length int) ([]byte, error) {
 		return nil, nil
 	}
 
-	readStart := time.Now()
 	if offset >= s.TotalSize {
 		return nil, nil
 	}
@@ -194,14 +185,6 @@ func (s *StreamSession) Read(offset int64, length int) ([]byte, error) {
 	// Trigger read-ahead prefetching for upcoming chunks within the sliding window
 	s.triggerSlidingWindowPrefetch(offset + int64(length))
 
-	readDur := time.Since(readStart)
-	s.streamer.diagMu.RLock()
-	diag := s.streamer.diagnostics
-	s.streamer.diagMu.RUnlock()
-	if diag != nil {
-		diag.RecordRead(s.TrackID, length, readDur, len(result))
-	}
-
 	return result, nil
 }
 
@@ -211,18 +194,18 @@ func (s *StreamSession) calculateChunkGeometry(offset int64) (int64, int) {
 	const oneMB int64 = 1024 * 1024
 
 	// Adaptive initial chunk: 0..256 KB
-	if offset < initialSmallChunkSize {
-		return 0, initialSmallChunkSize
+	if offset < config.InitialSmallChunkSize {
+		return 0, config.InitialSmallChunkSize
 	}
 	// Remainder of first megabyte: 256 KB..1 MB
 	if offset < oneMB {
-		return initialSmallChunkSize, int(oneMB - initialSmallChunkSize)
+		return config.InitialSmallChunkSize, int(oneMB - config.InitialSmallChunkSize)
 	}
 
 	// Normal 1 MB aligned chunk
 	alignedOffset := (offset / 4096) * 4096
 	bytesToBoundary := oneMB - (alignedOffset % oneMB)
-	limit := fullChunkSize
+	limit := config.FullChunkSize
 	if int64(limit) > bytesToBoundary {
 		limit = int(bytesToBoundary)
 	}
@@ -233,20 +216,7 @@ func (s *StreamSession) calculateChunkGeometry(offset int64) (int64, int) {
 func (s *StreamSession) fetchChunkWithSingleflight(chunkOffset int64, chunkLimit int) ([]byte, error) {
 	// 1. Check cache (zero-copy immutable slice)
 	if data, found := s.streamer.prefetchCache.Get(s.TrackID, chunkOffset, chunkLimit); found {
-		s.streamer.diagMu.RLock()
-		diag := s.streamer.diagnostics
-		s.streamer.diagMu.RUnlock()
-		if diag != nil {
-			diag.RecordCacheAccess(s.TrackID, true)
-		}
 		return data, nil
-	}
-
-	s.streamer.diagMu.RLock()
-	diag := s.streamer.diagnostics
-	s.streamer.diagMu.RUnlock()
-	if diag != nil {
-		diag.RecordCacheAccess(s.TrackID, false)
 	}
 
 	// 2. Singleflight deduplication per (trackID, chunkOffset, chunkLimit)
@@ -276,11 +246,11 @@ func (s *StreamSession) fetchChunkWithSingleflight(chunkOffset int64, chunkLimit
 
 // triggerSlidingWindowPrefetch queues prefetches for chunks within the target seconds window.
 func (s *StreamSession) triggerSlidingWindowPrefetch(fromOffset int64) {
-	windowBytes := s.BitrateBps * defaultReadAheadSec
-	if windowBytes < minReadAheadBytes {
-		windowBytes = minReadAheadBytes
-	} else if windowBytes > maxReadAheadBytes {
-		windowBytes = maxReadAheadBytes
+	windowBytes := s.BitrateBps * config.DefaultReadAheadSec
+	if windowBytes < config.MinReadAheadBytes {
+		windowBytes = config.MinReadAheadBytes
+	} else if windowBytes > config.MaxReadAheadBytes {
+		windowBytes = config.MaxReadAheadBytes
 	}
 
 	endOffset := fromOffset + windowBytes
@@ -338,9 +308,9 @@ func (s *StreamSession) triggerSlidingWindowPrefetch(fromOffset int64) {
 
 // cancelPrefetchesOutsideWindowLocked cancels background prefetches no longer within window on seek.
 func (s *StreamSession) cancelPrefetchesOutsideWindowLocked(newOffset int64) {
-	windowBytes := s.BitrateBps * defaultReadAheadSec
-	if windowBytes < minReadAheadBytes {
-		windowBytes = minReadAheadBytes
+	windowBytes := s.BitrateBps * config.DefaultReadAheadSec
+	if windowBytes < config.MinReadAheadBytes {
+		windowBytes = config.MinReadAheadBytes
 	}
 	windowEnd := newOffset + windowBytes
 

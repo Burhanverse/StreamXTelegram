@@ -3,9 +3,12 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -217,5 +220,65 @@ func TestLatencyMeasurements(t *testing.T) {
 	}
 	if seekLatency > 100*time.Millisecond {
 		t.Errorf("seek latency too high for local loopback: %v", seekLatency)
+	}
+}
+
+func TestHTTPSArtworkServing(t *testing.T) {
+	artDir := t.TempDir()
+	testArtBytes := []byte("jpeg-image-content-for-testing")
+	if err := os.WriteFile(filepath.Join(artDir, "track_https_1.jpg"), testArtBytes, 0644); err != nil {
+		t.Fatalf("failed to write test artwork: %v", err)
+	}
+
+	srv, err := New(Config{
+		Token:      "test-token",
+		Port:       0,
+		ArtworkDir: artDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	srv.Start()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	if srv.HTTPSPort() == 0 {
+		t.Fatal("expected HTTPSPort > 0")
+	}
+
+	tlsClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName: "local.burhanverse.eu.org",
+			},
+		},
+	}
+
+	url := fmt.Sprintf("https://127.0.0.1:%d/artwork/track_https_1.jpg?token=%s", srv.HTTPSPort(), srv.Token())
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Host = "local.burhanverse.eu.org"
+
+	resp, err := tlsClient.Do(req)
+	if err != nil {
+		t.Fatalf("HTTPS GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Errorf("expected Content-Type image/jpeg, got %s", ct)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+	if !bytes.Equal(body, testArtBytes) {
+		t.Errorf("artwork body mismatch: got %d bytes, want %d bytes", len(body), len(testArtBytes))
 	}
 }

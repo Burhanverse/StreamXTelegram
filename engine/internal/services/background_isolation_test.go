@@ -126,3 +126,96 @@ func TestPrompt2_NegativeCacheRespected(t *testing.T) {
 		}
 	}
 }
+
+// 4. Task 7: Exponential backoff on transient errors and attempt capping
+func TestTask7_TransientRetryExponentialBackoff(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_backoff.db")
+	db, err := database.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open test db: %v", err)
+	}
+	defer db.Close()
+
+	service := NewEnrichmentService(db)
+	defer service.Stop()
+
+	ctx := context.Background()
+	trackID := "track_transient_test"
+	track := &models.Track{
+		ID:        trackID,
+		Title:     "Transient Track",
+		CreatedAt: time.Now(),
+	}
+	_ = db.SaveTrack(ctx, track)
+
+	// Simulate transient errors across attempts
+	for attempt := 0; attempt < 5; attempt++ {
+		currentAttempts, err := db.GetEnrichmentAttempts(ctx, trackID)
+		if err != nil {
+			t.Fatalf("GetEnrichmentAttempts failed: %v", err)
+		}
+		if currentAttempts != attempt {
+			t.Fatalf("Expected %d attempts before retry, got %d", attempt, currentAttempts)
+		}
+
+		service.recordTransientRetry(ctx, trackID, context.DeadlineExceeded)
+
+		// Verify state was saved as transient_retry
+		attemptsAfter, _ := db.GetEnrichmentAttempts(ctx, trackID)
+		if attemptsAfter != attempt+1 {
+			t.Fatalf("Expected %d attempts after retry, got %d", attempt+1, attemptsAfter)
+		}
+
+		// Verify track is excluded from unenriched while backoff is active
+		unenriched, _ := db.ListUnenrichedTrackIDs(ctx)
+		for _, id := range unenriched {
+			if id == trackID {
+				t.Fatalf("Track %s should be excluded during transient backoff at attempt %d", trackID, attempt+1)
+			}
+		}
+	}
+
+	// 6th attempt: exceeds maxTransientAttempts (5) -> must be marked as permanently "failed"
+	service.recordTransientRetry(ctx, trackID, context.DeadlineExceeded)
+	status, err := db.GetEnrichmentStatus(ctx, trackID)
+	if err != nil {
+		t.Fatalf("GetEnrichmentStatus failed: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("Expected status 'failed' after exceeding max retries, got '%s'", status)
+	}
+}
+
+// 5. Task 7: EnrichTrack yields to active sync
+func TestTask7_EnrichTrackYieldsToSync(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_sync_yield.db")
+	db, err := database.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open test db: %v", err)
+	}
+	defer db.Close()
+
+	service := NewEnrichmentService(db)
+	defer service.Stop()
+
+	var syncActive atomic.Bool
+	syncActive.Store(true)
+	service.SetSyncChecker(func() bool {
+		return syncActive.Load()
+	})
+
+	ctx := context.Background()
+	trackID := "track_sync_test"
+	track := &models.Track{
+		ID:        trackID,
+		Title:     "Sync Test Track",
+		CreatedAt: time.Now(),
+	}
+	_ = db.SaveTrack(ctx, track)
+
+	// EnrichTrack must yield immediately and return nil without running extraction
+	err = service.EnrichTrack(ctx, trackID)
+	if err != nil {
+		t.Fatalf("EnrichTrack should return nil when yielding, got: %v", err)
+	}
+}

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -25,32 +26,36 @@ import (
 
 // Server is the local loopback HTTP REST and audio streaming server.
 type Server struct {
-	listener   net.Listener
-	port       int
-	token      string
-	httpSrv    *http.Server
-	streamer   *stream.Streamer
-	client     telegram.Client
-	db         *database.DB
-	chatID     int64
-	artworkDir string
-	enrichment *services.EnrichmentService
-	catchup    *telegram.CatchupService
-	mu         sync.Mutex
-	started    time.Time
+	listener    net.Listener
+	tlsListener net.Listener
+	port        int
+	httpsPort   int
+	token       string
+	httpSrv     *http.Server
+	httpsSrv    *http.Server
+	streamer    *stream.Streamer
+	client      telegram.Client
+	db          *database.DB
+	chatID      int64
+	artworkDir  string
+	enrichment  *services.EnrichmentService
+	catchup     *telegram.CatchupService
+	mu          sync.Mutex
+	started     time.Time
 }
 
 // Config specifies server configuration options.
 type Config struct {
 	Token       string
 	Port        int
+	HTTPSPort   int
+	CertsDir    string
 	Client      telegram.Client
 	DB          *database.DB
 	ChatID      int64
 	ArtworkDir  string
 	Enrichment  *services.EnrichmentService
 	Catchup     *telegram.CatchupService
-	Diagnostics *stream.StreamDiagnostics
 }
 
 // New creates and configures a new loopback server bound to 127.0.0.1:<port>.
@@ -91,9 +96,6 @@ func New(cfg Config) (*Server, error) {
 		catchup:    cfg.Catchup,
 		started:    time.Now(),
 	}
-	if cfg.Diagnostics != nil {
-		s.streamer.SetDiagnostics(cfg.Diagnostics)
-	}
 
 	mux := http.NewServeMux()
 
@@ -102,7 +104,7 @@ func New(cfg Config) (*Server, error) {
 
 	// Stream and Media endpoints (authenticated)
 	mux.HandleFunc("/stream/", s.authMiddleware(s.handleStream))
-	mux.HandleFunc("/artwork/", s.authMiddleware(s.handleArtwork))
+	mux.HandleFunc("/artwork/", s.artworkAuthMiddleware(s.handleArtwork))
 	mux.HandleFunc("/lyrics/", s.authMiddleware(s.handleLyrics))
 
 	// REST API Catalog Navigation endpoints (authenticated)
@@ -127,29 +129,65 @@ func New(cfg Config) (*Server, error) {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	if cert, err := loadCertificate(cfg.CertsDir); err == nil && cert != nil {
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{*cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		rawTLS, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", cfg.HTTPSPort))
+		if err == nil {
+			s.tlsListener = tls.NewListener(rawTLS, tlsConfig)
+			if tcpAddr, ok := rawTLS.Addr().(*net.TCPAddr); ok {
+				s.httpsPort = tcpAddr.Port
+			}
+			s.httpsSrv = &http.Server{
+				Handler:      mux,
+				ReadTimeout:  30 * time.Second,
+				WriteTimeout: 0,
+				IdleTimeout:  60 * time.Second,
+			}
+		}
+	}
+
 	return s, nil
 }
 
-// Start runs the HTTP server in a background goroutine.
+// Start runs the HTTP and HTTPS servers in background goroutines.
 func (s *Server) Start() {
 	go func() {
 		_ = s.httpSrv.Serve(s.listener)
 	}()
+	if s.tlsListener != nil && s.httpsSrv != nil {
+		go func() {
+			_ = s.httpsSrv.Serve(s.tlsListener)
+		}()
+	}
 }
 
-// Close shuts down the server and listener.
+// Close shuts down the HTTP and HTTPS servers and listeners.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var err error
 	if s.httpSrv != nil {
-		return s.httpSrv.Close()
+		err = s.httpSrv.Close()
 	}
-	return nil
+	if s.httpsSrv != nil {
+		if tlsErr := s.httpsSrv.Close(); tlsErr != nil && err == nil {
+			err = tlsErr
+		}
+	}
+	return err
 }
 
 // Port returns the bound port.
 func (s *Server) Port() int {
 	return s.port
+}
+
+// HTTPSPort returns the bound HTTPS port, or 0 if TLS is inactive.
+func (s *Server) HTTPSPort() int {
+	return s.httpsPort
 }
 
 // Token returns the session security token.
@@ -186,6 +224,22 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		next(w, r)
+	}
+}
+
+func (s *Server) artworkAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.URL.Query().Get("token")
+		if token != "" && token == s.token {
+			next(w, r)
+			return
+		}
+		remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err == nil && (remoteHost == "127.0.0.1" || remoteHost == "::1") {
+			next(w, r)
+			return
+		}
+		s.authMiddleware(next)(w, r)
 	}
 }
 
@@ -251,6 +305,9 @@ func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleArtwork(w http.ResponseWriter, r *http.Request) {
 	trackID := strings.TrimPrefix(r.URL.Path, "/artwork/")
+	trackID = strings.TrimSuffix(trackID, ".jpg")
+	trackID = strings.TrimSuffix(trackID, ".jpeg")
+	trackID = strings.TrimSuffix(trackID, ".png")
 	if trackID == "" {
 		http.Error(w, "Track ID required", http.StatusBadRequest)
 		return
@@ -264,37 +321,29 @@ func (s *Server) handleArtwork(w http.ResponseWriter, r *http.Request) {
 		if info, err := os.Stat(localPath); err == nil && info.Size() > 0 {
 			w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
 			http.ServeFile(w, r, localPath)
 			return
 		}
 	}
 
-	// 2. On-demand embedded metadata & picture extraction from first chunk
+	// 2. On-demand embedded metadata & picture extraction
 	if s.streamer != nil {
-		chunk, err := s.streamer.ReadChunk(ctx, trackID, 0, 512*1024)
-		if err == nil && len(chunk) > 0 {
-			meta := metadata.ParseAudioHeader(chunk)
-			if meta != nil && len(meta.Picture) > 0 {
-				if s.artworkDir != "" {
-					localPath := filepath.Join(s.artworkDir, trackID+".jpg")
-					_ = os.WriteFile(localPath, meta.Picture, 0644)
-				}
-				if s.db != nil {
-					_ = s.db.UpdateTrackEnrichmentWithAlbum(ctx, trackID, meta.Album, "/artwork/"+trackID, "/artwork/"+trackID, "", "", meta.Year)
-				}
-				mime := meta.PictureMime
-				if mime == "" {
-					mime = "image/jpeg"
-				}
+		trackSize, _ := s.streamer.GetTrackSize(ctx, trackID)
+		_, hasArt, _ := metadata.ExtractEmbeddedMetadata(ctx, trackID, s.streamer, trackSize, s.artworkDir)
+		if hasArt && s.artworkDir != "" {
+			localPath := filepath.Join(s.artworkDir, trackID+".jpg")
+			if info, err := os.Stat(localPath); err == nil && info.Size() > 0 {
 				w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
-				w.Header().Set("Content-Type", mime)
-				_, _ = w.Write(meta.Picture)
+				w.Header().Set("Content-Type", "image/jpeg")
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				http.ServeFile(w, r, localPath)
 				return
 			}
 		}
 	}
 
-	// 3. Check if track has remote CoverURL or ThumbURL
+	// 3. Check if track has remote ThumbnailURL or CoverURL
 	var coverURL string
 	var tr *models.Track
 	if s.db != nil {
@@ -302,8 +351,8 @@ func (s *Server) handleArtwork(w http.ResponseWriter, r *http.Request) {
 			tr = t
 			if strings.HasPrefix(t.CoverURL, "http://") || strings.HasPrefix(t.CoverURL, "https://") {
 				coverURL = t.CoverURL
-			} else if strings.HasPrefix(t.ThumbURL, "http://") || strings.HasPrefix(t.ThumbURL, "https://") {
-				coverURL = t.ThumbURL
+			} else if strings.HasPrefix(t.ThumbnailURL, "http://") || strings.HasPrefix(t.ThumbnailURL, "https://") {
+				coverURL = t.ThumbnailURL
 			}
 		}
 	}

@@ -285,5 +285,34 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <!-- Home Page Footer -->
+        <LinearLayout
+            android:id="@+id/footerLayout"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="8dp"
+            android:gravity="center"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/footerTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="StreamX Telegram Extension"
+                android:textColor="#71717A"
+                android:textSize="12sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/footerSubtitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="v1.1 • On-Device Engine"
+                android:textColor="#52525B"
+                android:textSize="11sp" />
+        </LinearLayout>
+
     </LinearLayout>
 </androidx.core.widget.NestedScrollView>

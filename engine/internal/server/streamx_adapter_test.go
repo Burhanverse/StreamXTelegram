@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,12 +59,16 @@ func setupTestStreamXServer(t *testing.T) (*Server, *database.DB, string) {
 	mockClient.RegisterTrackWithPayload(tr1, make([]byte, 1024))
 	mockClient.RegisterTrackWithPayload(tr2, make([]byte, 1024))
 
+	artDir := filepath.Join(tmpDir, "artwork")
+	_ = os.MkdirAll(artDir, 0755)
+
 	srv, err := New(Config{
-		Token:  "test-streamx-token",
-		Port:   0,
-		Client: mockClient,
-		DB:     db,
-		ChatID: chatID,
+		Token:      "test-streamx-token",
+		Port:       0,
+		ArtworkDir: artDir,
+		Client:     mockClient,
+		DB:         db,
+		ChatID:     chatID,
 	})
 	if err != nil {
 		t.Fatalf("server.New failed: %v", err)
@@ -661,6 +666,25 @@ func TestStreamXArtworkResolution(t *testing.T) {
 	}
 	if !foundTopicWithArt {
 		t.Errorf("expected home:topics to include topic 100 with valid https thumbnail")
+	}
+
+	// 7. Local disk art returns HTTPS URL when TLS is active
+	tr2, _ := db.GetTrack(ctx, "streamx_track_2")
+	if tr2 != nil && srv.artworkDir != "" {
+		artPath := filepath.Join(srv.artworkDir, tr2.ID+".jpg")
+		_ = os.WriteFile(artPath, []byte("fake_jpeg_bytes"), 0644)
+		art := srv.trackArtworkURL(tr2)
+		if srv.HTTPSPort() > 0 {
+			expected := fmt.Sprintf("https://local.burhanverse.eu.org:%d/artwork/%s.jpg?token=%s", srv.HTTPSPort(), tr2.ID, token)
+			if art != expected {
+				t.Errorf("expected local disk art with TLS to return '%s', got '%s'", expected, art)
+			}
+		} else {
+			expected := "content://com.music.streamx.extensions.telegram.source/art/" + tr2.ID
+			if art != expected {
+				t.Errorf("expected local disk art to return '%s', got '%s'", expected, art)
+			}
+		}
 	}
 }
 

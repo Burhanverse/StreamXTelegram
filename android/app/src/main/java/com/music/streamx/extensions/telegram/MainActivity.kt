@@ -107,7 +107,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            logAndDisplay(statusView, "Engine started on port ${startResult?.port}\nToken: [REDACTED]\nStream URL: $streamUrl")
+            logAndDisplay(statusView, "Engine started on HTTP port ${startResult?.port}, HTTPS port ${startResult?.httpsPort}\nToken: [REDACTED]\nStream URL: $streamUrl")
 
             // 3. Start & Bind PlaybackService
             val intent = Intent(this@MainActivity, PlaybackService::class.java)

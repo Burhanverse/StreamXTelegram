@@ -14,10 +14,11 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"musix/engine/internal/metadata"
 	"musix/engine/internal/models"
 )
 
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 7
 
 // DB encapsulates the embedded SQLite database for on-device metadata.
 type DB struct {
@@ -90,16 +91,33 @@ func (d *DB) migrate() error {
 		return fmt.Errorf("failed to query schema version: %w", err)
 	}
 
-	if version < 1 {
+	const currentSchemaVersion = 8
+	if version != currentSchemaVersion {
+		// Rule 3: NO MIGRATION CODE. Recreate database from scratch cleanly.
+		tables := []string{
+			"playlist_tracks",
+			"playlists",
+			"track_sources",
+			"worker_file_refs",
+			"enrichment_state",
+			"backups",
+			"topics",
+			"sync_state",
+			"tracks",
+		}
+		for _, tbl := range tables {
+			_, _ = d.db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s;", tbl))
+		}
+		_, _ = d.db.ExecContext(ctx, "DELETE FROM schema_migrations;")
+
 		tx, err := d.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
 
-		// 1. Sync state for gotd updates catch-up
-		if _, err := tx.ExecContext(ctx, `
-			CREATE TABLE IF NOT EXISTS sync_state (
+		schemaSQL := `
+			CREATE TABLE sync_state (
 				channel_id INTEGER PRIMARY KEY,
 				pts INTEGER NOT NULL DEFAULT 0,
 				date INTEGER NOT NULL DEFAULT 0,
@@ -107,32 +125,40 @@ func (d *DB) migrate() error {
 				max_msg_id INTEGER NOT NULL DEFAULT 0,
 				updated_at DATETIME NOT NULL
 			);
-		`); err != nil {
-			return err
-		}
 
-		// 2. Canonical tracks table
-		if _, err := tx.ExecContext(ctx, `
-			CREATE TABLE IF NOT EXISTS tracks (
+			CREATE TABLE tracks (
 				id TEXT PRIMARY KEY,
 				title TEXT NOT NULL,
 				artist TEXT NOT NULL,
+				artists TEXT NOT NULL DEFAULT '',
 				album TEXT NOT NULL,
+				album_artist TEXT NOT NULL DEFAULT '',
+				track_number INTEGER NOT NULL DEFAULT 0,
+				disc_number INTEGER NOT NULL DEFAULT 0,
+				year INTEGER NOT NULL DEFAULT 0,
+				genre TEXT NOT NULL DEFAULT '',
+				composer TEXT NOT NULL DEFAULT '',
 				duration_sec INTEGER NOT NULL,
+				sample_rate INTEGER NOT NULL DEFAULT 0,
 				mime_type TEXT NOT NULL,
 				file_size INTEGER NOT NULL,
 				file_name TEXT NOT NULL,
+				fingerprint TEXT DEFAULT '',
+				thumbnail_url TEXT DEFAULT '',
+				cover_url TEXT DEFAULT '',
+				lyrics TEXT DEFAULT '',
+				synced_lyrics TEXT DEFAULT '',
+				match_source TEXT DEFAULT '',
+				match_score REAL DEFAULT 0.0,
+				matched_at DATETIME,
+				meta_version INTEGER DEFAULT 3,
 				created_at DATETIME NOT NULL
 			);
-			CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist);
-			CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album);
-		`); err != nil {
-			return err
-		}
+			CREATE INDEX idx_tracks_artist ON tracks(artist);
+			CREATE INDEX idx_tracks_album ON tracks(album);
+			CREATE INDEX idx_tracks_album_group ON tracks(album, album_artist, year);
 
-		// 3. Track sources (one track -> many chat_id/msg_id mappings)
-		if _, err := tx.ExecContext(ctx, `
-			CREATE TABLE IF NOT EXISTS track_sources (
+			CREATE TABLE track_sources (
 				track_id TEXT NOT NULL,
 				chat_id INTEGER NOT NULL,
 				msg_id INTEGER NOT NULL,
@@ -142,16 +168,11 @@ func (d *DB) migrate() error {
 				PRIMARY KEY(track_id, chat_id, msg_id),
 				FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
 			);
-			CREATE INDEX IF NOT EXISTS idx_sources_msg ON track_sources(chat_id, msg_id);
-			CREATE INDEX IF NOT EXISTS idx_sources_topic ON track_sources(topic_id);
-			CREATE INDEX IF NOT EXISTS idx_sources_file_unique ON track_sources(file_unique_id);
-		`); err != nil {
-			return err
-		}
+			CREATE INDEX idx_sources_msg ON track_sources(chat_id, msg_id);
+			CREATE INDEX idx_sources_topic ON track_sources(topic_id);
+			CREATE INDEX idx_sources_file_unique ON track_sources(file_unique_id);
 
-		// 4. Per-bot cached file locations ({bot_id, msg_id} -> {doc_id, access_hash, file_reference})
-		if _, err := tx.ExecContext(ctx, `
-			CREATE TABLE IF NOT EXISTS worker_file_refs (
+			CREATE TABLE worker_file_refs (
 				bot_id TEXT NOT NULL,
 				msg_id INTEGER NOT NULL,
 				doc_id INTEGER NOT NULL DEFAULT 0,
@@ -161,85 +182,21 @@ func (d *DB) migrate() error {
 				updated_at DATETIME NOT NULL,
 				PRIMARY KEY(bot_id, msg_id)
 			);
-		`); err != nil {
-			return err
-		}
 
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?);`, time.Now()); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-
-	if version < 2 {
-		tx, err := d.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-
-		alterStmts := []string{
-			`ALTER TABLE tracks ADD COLUMN fingerprint TEXT DEFAULT '';`,
-			`ALTER TABLE tracks ADD COLUMN cover_url TEXT DEFAULT '';`,
-			`ALTER TABLE tracks ADD COLUMN thumb_url TEXT DEFAULT '';`,
-			`ALTER TABLE tracks ADD COLUMN lyrics TEXT DEFAULT '';`,
-			`ALTER TABLE tracks ADD COLUMN synced_lyrics TEXT DEFAULT '';`,
-			`ALTER TABLE tracks ADD COLUMN year INTEGER DEFAULT 0;`,
-			`CREATE INDEX IF NOT EXISTS idx_tracks_fingerprint ON tracks(fingerprint);`,
-			`CREATE TABLE IF NOT EXISTS topics (
+			CREATE TABLE topics (
 				id INTEGER NOT NULL,
 				chat_id INTEGER NOT NULL,
 				name TEXT NOT NULL,
-				track_count INTEGER DEFAULT 0,
+				track_count INTEGER NOT NULL DEFAULT 0,
+				icon_color INTEGER DEFAULT 0,
+				icon_emoji_id INTEGER DEFAULT 0,
+				is_folder BOOLEAN DEFAULT 1,
+				artwork_url TEXT DEFAULT '',
 				updated_at DATETIME NOT NULL,
-				PRIMARY KEY(chat_id, id)
-			);`,
-		}
-		for _, stmt := range alterStmts {
-			_, _ = tx.ExecContext(ctx, stmt)
-		}
+				PRIMARY KEY(id, chat_id)
+			);
 
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?);`, time.Now()); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-
-	if version < 3 {
-		tx, err := d.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-
-		_, _ = tx.ExecContext(ctx, `ALTER TABLE worker_file_refs ADD COLUMN doc_id INTEGER DEFAULT 0;`)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?);`, time.Now()); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-
-	if version < 4 {
-		tx, err := d.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-
-		alterStmts := []string{
-			`ALTER TABLE topics ADD COLUMN icon_color INTEGER DEFAULT 0;`,
-			`ALTER TABLE topics ADD COLUMN icon_emoji_id INTEGER DEFAULT 0;`,
-			`ALTER TABLE topics ADD COLUMN is_folder BOOLEAN DEFAULT 1;`,
-			`CREATE TABLE IF NOT EXISTS playlists (
+			CREATE TABLE playlists (
 				id TEXT PRIMARY KEY,
 				chat_id INTEGER NOT NULL DEFAULT 0,
 				topic_id INTEGER NOT NULL DEFAULT 0,
@@ -251,10 +208,11 @@ func (d *DB) migrate() error {
 				track_count INTEGER DEFAULT 0,
 				created_at DATETIME NOT NULL,
 				updated_at DATETIME NOT NULL
-			);`,
-			`CREATE INDEX IF NOT EXISTS idx_playlists_topic ON playlists(topic_id);`,
-			`CREATE INDEX IF NOT EXISTS idx_playlists_parent ON playlists(parent_folder_id);`,
-			`CREATE TABLE IF NOT EXISTS playlist_tracks (
+			);
+			CREATE INDEX idx_playlists_topic ON playlists(topic_id);
+			CREATE INDEX idx_playlists_parent ON playlists(parent_folder_id);
+
+			CREATE TABLE playlist_tracks (
 				playlist_id TEXT NOT NULL,
 				track_id TEXT NOT NULL,
 				position INTEGER NOT NULL,
@@ -262,9 +220,10 @@ func (d *DB) migrate() error {
 				PRIMARY KEY (playlist_id, track_id),
 				FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
 				FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
-			);`,
-			`CREATE INDEX IF NOT EXISTS idx_pl_tracks_pos ON playlist_tracks(playlist_id, position);`,
-			`CREATE TABLE IF NOT EXISTS backups (
+			);
+			CREATE INDEX idx_pl_tracks_pos ON playlist_tracks(playlist_id, position);
+
+			CREATE TABLE backups (
 				msg_id INTEGER PRIMARY KEY,
 				chat_id INTEGER NOT NULL,
 				topic_id INTEGER NOT NULL,
@@ -273,31 +232,10 @@ func (d *DB) migrate() error {
 				file_reference BLOB,
 				caption TEXT DEFAULT '',
 				created_at DATETIME NOT NULL
-			);`,
-			`CREATE INDEX IF NOT EXISTS idx_backups_topic ON backups(chat_id, topic_id);`,
-		}
-		for _, stmt := range alterStmts {
-			_, _ = tx.ExecContext(ctx, stmt)
-		}
+			);
+			CREATE INDEX idx_backups_topic ON backups(chat_id, topic_id);
 
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?);`, time.Now()); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-
-	if version < 5 {
-		tx, err := d.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-
-		_, err = tx.ExecContext(ctx, `
-			CREATE TABLE IF NOT EXISTS enrichment_state (
+			CREATE TABLE enrichment_state (
 				track_id TEXT PRIMARY KEY,
 				status TEXT NOT NULL,
 				attempts INTEGER NOT NULL DEFAULT 0,
@@ -306,45 +244,18 @@ func (d *DB) migrate() error {
 				expires_at DATETIME NOT NULL,
 				FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
 			);
-			CREATE INDEX IF NOT EXISTS idx_enrichment_state_status ON enrichment_state(status, expires_at);
-		`)
-		if err != nil {
+			CREATE INDEX idx_enrichment_state_status ON enrichment_state(status, expires_at);
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
+			return fmt.Errorf("failed creating schema v7: %w", err)
+		}
+
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);`, currentSchemaVersion, time.Now()); err != nil {
 			return err
 		}
 
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?);`, time.Now()); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-
-	if version < 6 {
-		tx, err := d.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-
-		alterStmts := []string{
-			`ALTER TABLE tracks ADD COLUMN match_source TEXT DEFAULT '';`,
-			`ALTER TABLE tracks ADD COLUMN match_score REAL DEFAULT 0.0;`,
-			`ALTER TABLE tracks ADD COLUMN matched_at DATETIME;`,
-			`ALTER TABLE tracks ADD COLUMN meta_version INTEGER DEFAULT 2;`,
-		}
-		for _, stmt := range alterStmts {
-			_, _ = tx.ExecContext(ctx, stmt)
-		}
-
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?);`, time.Now()); err != nil {
-			return err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return err
-		}
+		return tx.Commit()
 	}
 
 	return nil
@@ -360,25 +271,39 @@ func (d *DB) SaveTrack(ctx context.Context, t *models.Track) error {
 		t.CreatedAt = now
 	}
 
+	artistsStr := ""
+	if len(t.Artists) > 0 {
+		artistsStr = strings.Join(t.Artists, ", ")
+	}
+
 	_, err := d.db.ExecContext(ctx, `
-		INSERT INTO tracks (id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at, fingerprint, cover_url, thumb_url, lyrics, synced_lyrics, year)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO tracks (
+			id, title, artist, artists, album, album_artist, track_number, disc_number,
+			year, genre, composer, duration_sec, sample_rate, mime_type, file_size, file_name,
+			fingerprint, thumbnail_url, cover_url, lyrics, synced_lyrics, match_source, match_score,
+			matched_at, meta_version, created_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			title = excluded.title,
-			artist = excluded.artist,
-			album = excluded.album,
-			duration_sec = excluded.duration_sec,
+			title = CASE WHEN tracks.match_source = 'embedded' AND tracks.title != '' THEN tracks.title ELSE excluded.title END,
+			artist = CASE WHEN tracks.match_source = 'embedded' AND tracks.artist != '' THEN tracks.artist ELSE excluded.artist END,
+			album = CASE WHEN tracks.match_source = 'embedded' AND tracks.album != '' THEN tracks.album ELSE excluded.album END,
+			duration_sec = CASE WHEN tracks.match_source = 'embedded' AND tracks.duration_sec > 0 THEN tracks.duration_sec ELSE excluded.duration_sec END,
 			mime_type = excluded.mime_type,
 			file_size = excluded.file_size,
 			file_name = excluded.file_name,
 			fingerprint = CASE WHEN excluded.fingerprint != '' THEN excluded.fingerprint ELSE tracks.fingerprint END,
+			thumbnail_url = CASE WHEN excluded.thumbnail_url != '' THEN excluded.thumbnail_url ELSE tracks.thumbnail_url END,
 			cover_url = CASE WHEN excluded.cover_url != '' THEN excluded.cover_url ELSE tracks.cover_url END,
-			thumb_url = CASE WHEN excluded.thumb_url != '' THEN excluded.thumb_url ELSE tracks.thumb_url END,
 			lyrics = CASE WHEN excluded.lyrics != '' THEN excluded.lyrics ELSE tracks.lyrics END,
 			synced_lyrics = CASE WHEN excluded.synced_lyrics != '' THEN excluded.synced_lyrics ELSE tracks.synced_lyrics END,
-			year = CASE WHEN excluded.year > 0 THEN excluded.year ELSE tracks.year END;
-	`, t.ID, t.Title, t.Artist, t.Album, t.DurationSec, t.MimeType, t.FileSize, t.FileName, t.CreatedAt,
-		t.Fingerprint, t.CoverURL, t.ThumbURL, t.Lyrics, t.SyncedLyrics, t.Year)
+			year = CASE WHEN tracks.year > 0 THEN tracks.year ELSE excluded.year END;
+	`,
+		t.ID, t.Title, t.Artist, artistsStr, t.Album, t.AlbumArtist, t.TrackNumber, t.DiscNumber,
+		t.Year, t.Genre, t.Composer, t.DurationSec, t.SampleRate, t.MimeType, t.FileSize, t.FileName,
+		t.Fingerprint, t.ThumbnailURL, t.CoverURL, t.Lyrics, t.SyncedLyrics, t.MatchSource, t.MatchScore,
+		t.MatchedAt, t.MetaVersion, t.CreatedAt,
+	)
 	return err
 }
 
@@ -394,22 +319,27 @@ func (d *DB) SaveTracksBatch(ctx context.Context, tracks []*models.Track) error 
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO tracks (id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at, fingerprint, cover_url, thumb_url, lyrics, synced_lyrics, year)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO tracks (
+			id, title, artist, artists, album, album_artist, track_number, disc_number,
+			year, genre, composer, duration_sec, sample_rate, mime_type, file_size, file_name,
+			fingerprint, thumbnail_url, cover_url, lyrics, synced_lyrics, match_source, match_score,
+			matched_at, meta_version, created_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			title = excluded.title,
-			artist = excluded.artist,
-			album = excluded.album,
-			duration_sec = excluded.duration_sec,
+			title = CASE WHEN tracks.match_source = 'embedded' AND tracks.title != '' THEN tracks.title ELSE excluded.title END,
+			artist = CASE WHEN tracks.match_source = 'embedded' AND tracks.artist != '' THEN tracks.artist ELSE excluded.artist END,
+			album = CASE WHEN tracks.match_source = 'embedded' AND tracks.album != '' THEN tracks.album ELSE excluded.album END,
+			duration_sec = CASE WHEN tracks.match_source = 'embedded' AND tracks.duration_sec > 0 THEN tracks.duration_sec ELSE excluded.duration_sec END,
 			mime_type = excluded.mime_type,
 			file_size = excluded.file_size,
 			file_name = excluded.file_name,
 			fingerprint = CASE WHEN excluded.fingerprint != '' THEN excluded.fingerprint ELSE tracks.fingerprint END,
+			thumbnail_url = CASE WHEN excluded.thumbnail_url != '' THEN excluded.thumbnail_url ELSE tracks.thumbnail_url END,
 			cover_url = CASE WHEN excluded.cover_url != '' THEN excluded.cover_url ELSE tracks.cover_url END,
-			thumb_url = CASE WHEN excluded.thumb_url != '' THEN excluded.thumb_url ELSE tracks.thumb_url END,
 			lyrics = CASE WHEN excluded.lyrics != '' THEN excluded.lyrics ELSE tracks.lyrics END,
 			synced_lyrics = CASE WHEN excluded.synced_lyrics != '' THEN excluded.synced_lyrics ELSE tracks.synced_lyrics END,
-			year = CASE WHEN excluded.year > 0 THEN excluded.year ELSE tracks.year END;
+			year = CASE WHEN tracks.year > 0 THEN tracks.year ELSE excluded.year END;
 	`)
 	if err != nil {
 		return err
@@ -422,9 +352,15 @@ func (d *DB) SaveTracksBatch(ctx context.Context, tracks []*models.Track) error 
 		if createdAt.IsZero() {
 			createdAt = now
 		}
+		artistsStr := ""
+		if len(t.Artists) > 0 {
+			artistsStr = strings.Join(t.Artists, ", ")
+		}
 		_, err := stmt.ExecContext(ctx,
-			t.ID, t.Title, t.Artist, t.Album, t.DurationSec, t.MimeType, t.FileSize, t.FileName,
-			createdAt, t.Fingerprint, t.CoverURL, t.ThumbURL, t.Lyrics, t.SyncedLyrics, t.Year,
+			t.ID, t.Title, t.Artist, artistsStr, t.Album, t.AlbumArtist, t.TrackNumber, t.DiscNumber,
+			t.Year, t.Genre, t.Composer, t.DurationSec, t.SampleRate, t.MimeType, t.FileSize, t.FileName,
+			t.Fingerprint, t.ThumbnailURL, t.CoverURL, t.Lyrics, t.SyncedLyrics, t.MatchSource, t.MatchScore,
+			t.MatchedAt, t.MetaVersion, createdAt,
 		)
 		if err != nil {
 			return err
@@ -440,9 +376,13 @@ func (d *DB) GetTrack(ctx context.Context, id string) (*models.Track, error) {
 	defer d.mu.RUnlock()
 
 	row := d.db.QueryRowContext(ctx, `
-		SELECT t.id, t.title, t.artist, t.album, t.duration_sec, t.mime_type, t.file_size, t.file_name, t.created_at,
-		       COALESCE(t.fingerprint, ''), COALESCE(t.cover_url, ''), COALESCE(t.thumb_url, ''),
-		       COALESCE(t.lyrics, ''), COALESCE(t.synced_lyrics, ''), COALESCE(t.year, 0),
+		SELECT t.id, t.title, t.artist, COALESCE(t.artists, ''), t.album, COALESCE(t.album_artist, ''),
+		       COALESCE(t.track_number, 0), COALESCE(t.disc_number, 0), COALESCE(t.year, 0),
+		       COALESCE(t.genre, ''), COALESCE(t.composer, ''), t.duration_sec, COALESCE(t.sample_rate, 0),
+		       t.mime_type, t.file_size, t.file_name, t.created_at,
+		       COALESCE(t.fingerprint, ''), COALESCE(t.thumbnail_url, ''), COALESCE(t.cover_url, ''),
+		       COALESCE(t.lyrics, ''), COALESCE(t.synced_lyrics, ''), COALESCE(t.match_source, ''),
+		       COALESCE(t.match_score, 0.0), COALESCE(t.meta_version, 3),
 		       COALESCE(s.chat_id, 0), COALESCE(s.msg_id, 0)
 		FROM tracks t
 		LEFT JOIN track_sources s ON t.id = s.track_id
@@ -451,57 +391,126 @@ func (d *DB) GetTrack(ctx context.Context, id string) (*models.Track, error) {
 	`, id)
 
 	var t models.Track
-	err := row.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-		&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year,
-		&t.ChatID, &t.MsgID)
+	var artistsStr string
+	err := row.Scan(
+		&t.ID, &t.Title, &t.Artist, &artistsStr, &t.Album, &t.AlbumArtist,
+		&t.TrackNumber, &t.DiscNumber, &t.Year,
+		&t.Genre, &t.Composer, &t.DurationSec, &t.SampleRate,
+		&t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
+		&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL,
+		&t.Lyrics, &t.SyncedLyrics, &t.MatchSource,
+		&t.MatchScore, &t.MetaVersion,
+		&t.ChatID, &t.MsgID,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	if artistsStr != "" {
+		for _, a := range strings.Split(artistsStr, ",") {
+			if s := strings.TrimSpace(a); s != "" {
+				t.Artists = append(t.Artists, s)
+			}
+		}
+	}
 	return &t, nil
 }
 
 // UpdateTrackEnrichment updates external metadata fields on an existing track record.
-func (d *DB) UpdateTrackEnrichment(ctx context.Context, id, coverURL, thumbURL, lyrics, syncedLyrics string, year int) error {
+func (d *DB) UpdateTrackEnrichment(ctx context.Context, id, coverURL, thumbnailURL, lyrics, syncedLyrics string, year int) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	_, err := d.db.ExecContext(ctx, `
 		UPDATE tracks SET
 			cover_url = CASE WHEN ? != '' THEN ? ELSE cover_url END,
-			thumb_url = CASE WHEN ? != '' THEN ? ELSE thumb_url END,
+			thumbnail_url = CASE WHEN ? != '' THEN ? ELSE thumbnail_url END,
 			lyrics = CASE WHEN ? != '' THEN ? ELSE lyrics END,
 			synced_lyrics = CASE WHEN ? != '' THEN ? ELSE synced_lyrics END,
 			year = CASE WHEN ? > 0 THEN ? ELSE year END
 		WHERE id = ?;
-	`, coverURL, coverURL, thumbURL, thumbURL, lyrics, lyrics, syncedLyrics, syncedLyrics, year, year, id)
+	`, coverURL, coverURL, thumbnailURL, thumbnailURL, lyrics, lyrics, syncedLyrics, syncedLyrics, year, year, id)
 	return err
 }
 
 // UpdateTrackEnrichmentWithAlbum updates external metadata fields including album on an existing track record.
-func (d *DB) UpdateTrackEnrichmentWithAlbum(ctx context.Context, id, album, coverURL, thumbURL, lyrics, syncedLyrics string, year int) error {
-	return d.UpdateTrackFullMetadata(ctx, id, "", "", album, coverURL, thumbURL, lyrics, syncedLyrics, year)
+func (d *DB) UpdateTrackEnrichmentWithAlbum(ctx context.Context, id, album, coverURL, thumbnailURL, lyrics, syncedLyrics string, year int) error {
+	return d.UpdateTrackFullMetadata(ctx, id, "", "", album, coverURL, thumbnailURL, lyrics, syncedLyrics, year)
 }
 
-// UpdateTrackFullMetadata updates title, artist, album, cover_url, thumb_url, lyrics, synced_lyrics, and year.
-func (d *DB) UpdateTrackFullMetadata(ctx context.Context, id, title, artist, album, coverURL, thumbURL, lyrics, syncedLyrics string, year int) error {
+// UpdateTrackFullMetadata updates title, artist, album, cover_url, thumbnail_url, lyrics, synced_lyrics, and year.
+// If track was already enriched from embedded authoritative tags (match_source = 'embedded'),
+// it never overwrites the embedded title, artist, album, or year.
+func (d *DB) UpdateTrackFullMetadata(ctx context.Context, id, title, artist, album, coverURL, thumbnailURL, lyrics, syncedLyrics string, year int) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	_, err := d.db.ExecContext(ctx, `
 		UPDATE tracks SET
-			title = CASE WHEN ? != '' THEN ? ELSE title END,
-			artist = CASE WHEN ? != '' AND ? != 'Unknown Artist' THEN ? ELSE artist END,
-			album = CASE WHEN ? != '' AND ? != 'Telegram Music' THEN ? ELSE album END,
+			title = CASE WHEN (match_source != 'embedded' OR match_source IS NULL) AND ? != '' THEN ? ELSE title END,
+			artist = CASE WHEN (match_source != 'embedded' OR match_source IS NULL) AND ? != '' AND ? != 'Unknown Artist' THEN ? ELSE artist END,
+			album = CASE WHEN (match_source != 'embedded' OR match_source IS NULL) AND ? != '' AND ? != 'Telegram Music' THEN ? ELSE album END,
 			cover_url = CASE WHEN ? != '' THEN ? ELSE cover_url END,
-			thumb_url = CASE WHEN ? != '' THEN ? ELSE thumb_url END,
+			thumbnail_url = CASE WHEN ? != '' THEN ? ELSE thumbnail_url END,
 			lyrics = CASE WHEN ? != '' THEN ? ELSE lyrics END,
 			synced_lyrics = CASE WHEN ? != '' THEN ? ELSE synced_lyrics END,
-			year = CASE WHEN ? > 0 THEN ? ELSE year END
+			year = CASE WHEN (match_source != 'embedded' OR match_source IS NULL) AND ? > 0 THEN ? ELSE year END
 		WHERE id = ?;
-	`, title, title, artist, artist, artist, album, album, album, coverURL, coverURL, thumbURL, thumbURL, lyrics, lyrics, syncedLyrics, syncedLyrics, year, year, id)
+	`, title, title, artist, artist, artist, album, album, album, coverURL, coverURL, thumbnailURL, thumbnailURL, lyrics, lyrics, syncedLyrics, syncedLyrics, year, year, id)
+	return err
+}
+
+// SaveEmbeddedTrackMetadata writes authoritative embedded metadata to the tracks table with match_source = 'embedded'.
+func (d *DB) SaveEmbeddedTrackMetadata(ctx context.Context, trackID string, meta *metadata.FLACMetadata, coverURL, thumbnailURL string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	artistsStr := ""
+	if len(meta.Artists) > 0 {
+		artistsStr = strings.Join(meta.Artists, ", ")
+	}
+
+	_, err := d.db.ExecContext(ctx, `
+		UPDATE tracks SET
+			title = CASE WHEN ? != '' THEN ? ELSE title END,
+			artist = CASE WHEN ? != '' THEN ? ELSE artist END,
+			artists = CASE WHEN ? != '' THEN ? ELSE artists END,
+			album = CASE WHEN ? != '' THEN ? ELSE album END,
+			album_artist = CASE WHEN ? != '' THEN ? ELSE album_artist END,
+			year = CASE WHEN ? > 0 THEN ? ELSE year END,
+			track_number = CASE WHEN ? > 0 THEN ? ELSE track_number END,
+			disc_number = CASE WHEN ? > 0 THEN ? ELSE disc_number END,
+			genre = CASE WHEN ? != '' THEN ? ELSE genre END,
+			composer = CASE WHEN ? != '' THEN ? ELSE composer END,
+			duration_sec = CASE WHEN ? > 0 THEN ? ELSE duration_sec END,
+			sample_rate = CASE WHEN ? > 0 THEN ? ELSE sample_rate END,
+			cover_url = CASE WHEN ? != '' THEN ? ELSE cover_url END,
+			thumbnail_url = CASE WHEN ? != '' THEN ? ELSE thumbnail_url END,
+			match_source = 'embedded',
+			match_score = 1.0,
+			matched_at = ?,
+			meta_version = 3
+		WHERE id = ?;
+	`,
+		meta.Title, meta.Title,
+		meta.Artist, meta.Artist,
+		artistsStr, artistsStr,
+		meta.Album, meta.Album,
+		meta.AlbumArtist, meta.AlbumArtist,
+		meta.Year, meta.Year,
+		meta.TrackNumber, meta.TrackNumber,
+		meta.DiscNumber, meta.DiscNumber,
+		meta.Genre, meta.Genre,
+		meta.Composer, meta.Composer,
+		meta.DurationSec, meta.DurationSec,
+		meta.SampleRate, meta.SampleRate,
+		coverURL, coverURL,
+		thumbnailURL, thumbnailURL,
+		time.Now(),
+		trackID,
+	)
 	return err
 }
 
@@ -521,6 +530,38 @@ func (d *DB) UpdateTrackMatchMetadata(ctx context.Context, id, matchSource strin
 	return err
 }
 
+// GetEnrichmentAttempts returns the number of times enrichment has been attempted for trackID.
+func (d *DB) GetEnrichmentAttempts(ctx context.Context, trackID string) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var attempts int
+	err := d.db.QueryRowContext(ctx, `SELECT attempts FROM enrichment_state WHERE track_id = ?;`, trackID).Scan(&attempts)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return attempts, nil
+}
+
+// GetEnrichmentStatus returns the current enrichment status for trackID, or "" if not found.
+func (d *DB) GetEnrichmentStatus(ctx context.Context, trackID string) (string, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var status string
+	err := d.db.QueryRowContext(ctx, `SELECT status FROM enrichment_state WHERE track_id = ?;`, trackID).Scan(&status)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return status, nil
+}
+
 // SaveEnrichmentState updates the persistent enrichment status, attempt count, and negative cache TTL.
 func (d *DB) SaveEnrichmentState(ctx context.Context, trackID string, status string, attempts int, reason string, ttl time.Duration) error {
 	d.mu.Lock()
@@ -532,7 +573,7 @@ func (d *DB) SaveEnrichmentState(ctx context.Context, trackID string, status str
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(track_id) DO UPDATE SET
 			status = excluded.status,
-			attempts = attempts + 1,
+			attempts = CASE WHEN excluded.attempts > 0 THEN excluded.attempts ELSE attempts + 1 END,
 			last_attempt = excluded.last_attempt,
 			reason = excluded.reason,
 			expires_at = excluded.expires_at;
@@ -548,36 +589,34 @@ func (d *DB) IsEnrichmentNegativeCached(ctx context.Context, trackID string) boo
 	var count int
 	err := d.db.QueryRowContext(ctx, `
 		SELECT COUNT(1) FROM enrichment_state
-		WHERE track_id = ? AND status = 'failed' AND expires_at > ?;
+		WHERE track_id = ? AND expires_at > ?;
 	`, trackID, time.Now()).Scan(&count)
 	return err == nil && count > 0
 }
 
-// ListUnenrichedTrackIDs returns track IDs that have no valid cover_url, have low match score,
-// or have default album/artist names, respecting negative cache TTL and capping batch size.
-func (d *DB) ListUnenrichedTrackIDs(ctx context.Context) ([]string, error) {
+// ListUnenrichedTrackIDs returns track IDs that need embedded extraction or online cover art fallback,
+// respecting negative cache TTL and capped at batch limit.
+func (d *DB) ListUnenrichedTrackIDs(ctx context.Context, batchLimit ...int) ([]string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
+	limit := 20
+	if len(batchLimit) > 0 && batchLimit[0] > 0 {
+		limit = batchLimit[0]
+	}
 
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT t.id FROM tracks t
 		LEFT JOIN enrichment_state e ON t.id = e.track_id
-		WHERE (
-			t.cover_url IS NULL 
-			OR t.cover_url = '' 
-			OR (t.meta_version < 2 AND NOT t.cover_url LIKE 'content://%')
-			OR (t.match_score < 0.70 AND NOT t.cover_url LIKE 'content://%')
-			OR t.thumb_url IS NULL 
-			OR t.thumb_url = '' 
-			OR t.album = 'Telegram Music' 
-			OR t.album = ''
-			OR t.artist = 'Unknown Artist'
-			OR t.artist = ''
-		)
-		AND (e.track_id IS NULL OR (e.status != 'success' AND e.expires_at <= ?))
+		WHERE (e.track_id IS NULL OR e.status != 'success')
+		  AND (e.track_id IS NULL OR e.expires_at <= ?)
+		  AND (
+			(t.match_source IS NULL OR t.match_source = '')
+			OR (t.thumbnail_url IS NULL OR t.thumbnail_url = '')
+		  )
 		ORDER BY t.created_at DESC
-		LIMIT 100;
-	`, time.Now())
+		LIMIT ?;
+	`, time.Now(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -591,6 +630,50 @@ func (d *DB) ListUnenrichedTrackIDs(ctx context.Context) ([]string, error) {
 		}
 	}
 	return ids, rows.Err()
+}
+
+// EnrichmentDiagnostics represents the summary counts of library enrichment state.
+type EnrichmentDiagnostics struct {
+	TotalTracks    int
+	EmbeddedOK     int
+	NoArt          int
+	TransientFails int
+	PermanentFails int
+	OnlineMatched  int
+	StillPending   int
+}
+
+// GetEnrichmentDiagnostics computes exact counts across tracks and enrichment_state.
+func (d *DB) GetEnrichmentDiagnostics(ctx context.Context) (EnrichmentDiagnostics, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var diag EnrichmentDiagnostics
+	_ = d.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM tracks`).Scan(&diag.TotalTracks)
+	_ = d.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM tracks WHERE match_source = 'embedded' AND thumbnail_url != ''`).Scan(&diag.EmbeddedOK)
+	_ = d.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM tracks WHERE (thumbnail_url IS NULL OR thumbnail_url = '') AND (cover_url IS NULL OR cover_url = '')`).Scan(&diag.NoArt)
+	_ = d.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM enrichment_state WHERE status = 'transient_retry'`).Scan(&diag.TransientFails)
+	_ = d.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM enrichment_state WHERE status = 'failed'`).Scan(&diag.PermanentFails)
+	_ = d.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM tracks WHERE match_source != '' AND match_source != 'embedded'`).Scan(&diag.OnlineMatched)
+	_ = d.db.QueryRowContext(ctx, `
+		SELECT COUNT(1) FROM tracks t
+		LEFT JOIN enrichment_state e ON t.id = e.track_id
+		WHERE (t.match_source IS NULL OR t.match_source = '')
+		   OR ((t.thumbnail_url IS NULL OR t.thumbnail_url = '') AND (e.track_id IS NULL OR e.status != 'failed'))
+	`).Scan(&diag.StillPending)
+
+	return diag, nil
+}
+
+// GetEnrichmentSummaryLine returns the formatted summary line requested by Item 11:
+// [ENRICH_SUMMARY] total=%d embedded_ok=%d no_art=%d transient_fails=%d permanent_fails=%d online_matched=%d pending=%d
+func (d *DB) GetEnrichmentSummaryLine(ctx context.Context) string {
+	diag, err := d.GetEnrichmentDiagnostics(ctx)
+	if err != nil {
+		return fmt.Sprintf("[ENRICH_SUMMARY] error: %v", err)
+	}
+	return fmt.Sprintf("[ENRICH_SUMMARY] total=%d embedded_ok=%d no_art=%d transient_fails=%d permanent_fails=%d online_matched=%d pending=%d",
+		diag.TotalTracks, diag.EmbeddedOK, diag.NoArt, diag.TransientFails, diag.PermanentFails, diag.OnlineMatched, diag.StillPending)
 }
 
 // ResetAllTables clears all tracks, sources, worker file references, topics, playlists, and sync state.
@@ -628,14 +711,14 @@ func (d *DB) FindTrackByFingerprint(ctx context.Context, fingerprint string) (*m
 
 	row := d.db.QueryRowContext(ctx, `
 		SELECT id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at,
-		       COALESCE(fingerprint, ''), COALESCE(cover_url, ''), COALESCE(thumb_url, ''),
+		       COALESCE(fingerprint, ''), COALESCE(thumbnail_url, ''), COALESCE(cover_url, ''),
 		       COALESCE(lyrics, ''), COALESCE(synced_lyrics, ''), COALESCE(year, 0)
 		FROM tracks WHERE fingerprint = ? LIMIT 1
 	`, fingerprint)
 
 	var t models.Track
 	err := row.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-		&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year)
+		&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -652,7 +735,7 @@ func (d *DB) FindTrackByFuzzy(ctx context.Context, title, artist string, duratio
 
 	query := `
 		SELECT id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at,
-		       COALESCE(fingerprint, ''), COALESCE(cover_url, ''), COALESCE(thumb_url, ''),
+		       COALESCE(fingerprint, ''), COALESCE(thumbnail_url, ''), COALESCE(cover_url, ''),
 		       COALESCE(lyrics, ''), COALESCE(synced_lyrics, ''), COALESCE(year, 0)
 		FROM tracks
 		WHERE LOWER(title) = LOWER(?) AND LOWER(artist) = LOWER(?)
@@ -668,7 +751,7 @@ func (d *DB) FindTrackByFuzzy(ctx context.Context, title, artist string, duratio
 
 	var t models.Track
 	err := row.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-		&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year)
+		&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -685,7 +768,7 @@ func (d *DB) FindTrackByFileUniqueID(ctx context.Context, fileUniqueID string) (
 
 	row := d.db.QueryRowContext(ctx, `
 		SELECT t.id, t.title, t.artist, t.album, t.duration_sec, t.mime_type, t.file_size, t.file_name, t.created_at,
-		       COALESCE(t.fingerprint, ''), COALESCE(t.cover_url, ''), COALESCE(t.thumb_url, ''),
+		       COALESCE(t.fingerprint, ''), COALESCE(t.thumbnail_url, ''), COALESCE(t.cover_url, ''),
 		       COALESCE(t.lyrics, ''), COALESCE(t.synced_lyrics, ''), COALESCE(t.year, 0)
 		FROM track_sources s
 		JOIN tracks t ON s.track_id = t.id
@@ -694,7 +777,7 @@ func (d *DB) FindTrackByFileUniqueID(ctx context.Context, fileUniqueID string) (
 
 	var t models.Track
 	err := row.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-		&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year)
+		&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -798,7 +881,7 @@ func (d *DB) GetTopic(ctx context.Context, chatID int64, topicID int32) (*models
 	err := d.db.QueryRowContext(ctx, `
 		SELECT tp.id, tp.chat_id, tp.name, COUNT(DISTINCT s.track_id),
 		       COALESCE(tp.icon_color, 0), COALESCE(tp.icon_emoji_id, 0), COALESCE(tp.is_folder, 1),
-		       COALESCE(NULLIF(MAX(t.cover_url), ''), MAX(t.thumb_url), ''),
+		       COALESCE(NULLIF(MAX(t.thumbnail_url), ''), MAX(t.cover_url), ''),
 		       tp.updated_at
 		FROM topics tp
 		LEFT JOIN track_sources s ON (tp.chat_id = s.chat_id OR s.chat_id = ? OR s.chat_id = ?) AND tp.id = s.topic_id
@@ -811,7 +894,7 @@ func (d *DB) GetTopic(ctx context.Context, chatID int64, topicID int32) (*models
 			// Fallback to track_sources if topic not yet explicitly in topics table
 			errFallback := d.db.QueryRowContext(ctx, `
 				SELECT s.topic_id, s.chat_id, CAST(s.topic_id AS TEXT), COUNT(DISTINCT s.track_id), 0, 0, 1,
-				       COALESCE(NULLIF(MAX(t.cover_url), ''), MAX(t.thumb_url), '')
+				       COALESCE(NULLIF(MAX(t.thumbnail_url), ''), MAX(t.cover_url), '')
 				FROM track_sources s
 				LEFT JOIN tracks t ON s.track_id = t.id
 				WHERE (s.chat_id = ? OR s.chat_id = ?) AND s.topic_id = ?
@@ -839,7 +922,7 @@ func (d *DB) ListTopics(ctx context.Context, chatID int64) ([]*models.Topic, err
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT tp.id, tp.chat_id, tp.name, COUNT(DISTINCT s.track_id),
 		       COALESCE(tp.icon_color, 0), COALESCE(tp.icon_emoji_id, 0), COALESCE(tp.is_folder, 1),
-		       COALESCE(NULLIF(MAX(t.cover_url), ''), MAX(t.thumb_url), '')
+		       COALESCE(NULLIF(MAX(t.thumbnail_url), ''), MAX(t.cover_url), '')
 		FROM topics tp
 		LEFT JOIN track_sources s ON (tp.chat_id = s.chat_id OR s.chat_id = ? OR s.chat_id = ?) AND tp.id = s.topic_id
 		LEFT JOIN tracks t ON s.track_id = t.id
@@ -847,7 +930,7 @@ func (d *DB) ListTopics(ctx context.Context, chatID int64) ([]*models.Topic, err
 		GROUP BY tp.id, tp.chat_id
 		UNION
 		SELECT s.topic_id, s.chat_id, CAST(s.topic_id AS TEXT), COUNT(DISTINCT s.track_id), 0, 0, 1,
-		       COALESCE(NULLIF(MAX(t.cover_url), ''), MAX(t.thumb_url), '')
+		       COALESCE(NULLIF(MAX(t.thumbnail_url), ''), MAX(t.cover_url), '')
 		FROM track_sources s
 		LEFT JOIN tracks t ON s.track_id = t.id
 		WHERE (s.chat_id = ? OR s.chat_id = ?) AND s.topic_id > 0 AND s.topic_id NOT IN (SELECT id FROM topics WHERE (chat_id = ? OR chat_id = ?))
@@ -1034,7 +1117,7 @@ func (d *DB) GetPlaylistTracks(ctx context.Context, playlistID string, offset, l
 
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT t.id, t.title, t.artist, t.album, t.duration_sec, t.mime_type, t.file_size, t.file_name, t.created_at,
-		       COALESCE(t.fingerprint, ''), COALESCE(t.cover_url, ''), COALESCE(t.thumb_url, ''),
+		       COALESCE(t.fingerprint, ''), COALESCE(t.thumbnail_url, ''), COALESCE(t.cover_url, ''),
 		       COALESCE(t.lyrics, ''), COALESCE(t.synced_lyrics, ''), COALESCE(t.year, 0)
 		FROM playlist_tracks pt
 		JOIN tracks t ON pt.track_id = t.id
@@ -1051,7 +1134,7 @@ func (d *DB) GetPlaylistTracks(ctx context.Context, playlistID string, offset, l
 	for rows.Next() {
 		var tr models.Track
 		if err := rows.Scan(&tr.ID, &tr.Title, &tr.Artist, &tr.Album, &tr.DurationSec, &tr.MimeType,
-			&tr.FileSize, &tr.FileName, &tr.CreatedAt, &tr.Fingerprint, &tr.CoverURL, &tr.ThumbURL,
+			&tr.FileSize, &tr.FileName, &tr.CreatedAt, &tr.Fingerprint, &tr.ThumbnailURL, &tr.CoverURL,
 			&tr.Lyrics, &tr.SyncedLyrics, &tr.Year); err != nil {
 			return nil, err
 		}
@@ -1122,7 +1205,7 @@ func (d *DB) ListTracks(ctx context.Context, offset, limit int) ([]*models.Track
 
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at,
-		       COALESCE(fingerprint, ''), COALESCE(cover_url, ''), COALESCE(thumb_url, ''),
+		       COALESCE(fingerprint, ''), COALESCE(thumbnail_url, ''), COALESCE(cover_url, ''),
 		       COALESCE(lyrics, ''), COALESCE(synced_lyrics, ''), COALESCE(year, 0)
 		FROM tracks ORDER BY created_at DESC LIMIT ? OFFSET ?
 	`, limit, offset)
@@ -1135,7 +1218,7 @@ func (d *DB) ListTracks(ctx context.Context, offset, limit int) ([]*models.Track
 	for rows.Next() {
 		var t models.Track
 		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-			&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
+			&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
 			return nil, 0, err
 		}
 		tracks = append(tracks, &t)
@@ -1151,7 +1234,7 @@ func (d *DB) ListTracksByTopic(ctx context.Context, chatID int64, topicID int32,
 	norm, alt := NormalizeChatID(chatID)
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT DISTINCT t.id, t.title, t.artist, t.album, t.duration_sec, t.mime_type, t.file_size, t.file_name, t.created_at,
-		       COALESCE(t.fingerprint, ''), COALESCE(t.cover_url, ''), COALESCE(t.thumb_url, ''),
+		       COALESCE(t.fingerprint, ''), COALESCE(t.thumbnail_url, ''), COALESCE(t.cover_url, ''),
 		       COALESCE(t.lyrics, ''), COALESCE(t.synced_lyrics, ''), COALESCE(t.year, 0)
 		FROM track_sources s
 		JOIN tracks t ON s.track_id = t.id
@@ -1168,7 +1251,7 @@ func (d *DB) ListTracksByTopic(ctx context.Context, chatID int64, topicID int32,
 	for rows.Next() {
 		var t models.Track
 		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-			&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
+			&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
 			return nil, err
 		}
 		tracks = append(tracks, &t)
@@ -1185,7 +1268,7 @@ func (d *DB) ListArtists(ctx context.Context, offset, limit int) ([]*models.Arti
 	_ = d.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT artist) FROM tracks WHERE artist != ''`).Scan(&total)
 
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT artist, COUNT(*) as track_count, COALESCE(NULLIF(MAX(thumb_url), ''), MAX(cover_url), '') as thumb
+		SELECT artist, COUNT(*) as track_count, COALESCE(NULLIF(MAX(thumbnail_url), ''), MAX(cover_url), '') as thumb
 		FROM tracks
 		WHERE artist != ''
 		GROUP BY artist
@@ -1200,7 +1283,7 @@ func (d *DB) ListArtists(ctx context.Context, offset, limit int) ([]*models.Arti
 	var artists []*models.Artist
 	for rows.Next() {
 		var a models.Artist
-		if err := rows.Scan(&a.Name, &a.TrackCount, &a.ThumbURL); err != nil {
+		if err := rows.Scan(&a.Name, &a.TrackCount, &a.ThumbnailURL); err != nil {
 			return nil, 0, err
 		}
 		a.ID = fmt.Sprintf("artist_%s", a.Name)
@@ -1209,19 +1292,25 @@ func (d *DB) ListArtists(ctx context.Context, offset, limit int) ([]*models.Arti
 	return artists, total, rows.Err()
 }
 
-// ListAlbums returns aggregated distinct albums with artist, year, track count, and coverart.
+// ListAlbums returns aggregated distinct albums grouped by (album, albumartist, year).
 func (d *DB) ListAlbums(ctx context.Context, offset, limit int) ([]*models.Album, int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	var total int
-	_ = d.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT album) FROM tracks WHERE album != ''`).Scan(&total)
+	_ = d.db.QueryRowContext(ctx, `
+		SELECT COUNT(1) FROM (
+			SELECT 1 FROM tracks
+			WHERE album != ''
+			GROUP BY album, COALESCE(NULLIF(album_artist, ''), artist), year
+		)
+	`).Scan(&total)
 
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT album, MAX(artist), MAX(year), COUNT(*) as track_count, COALESCE(NULLIF(MAX(cover_url), ''), MAX(thumb_url), '')
+		SELECT album, COALESCE(NULLIF(MAX(album_artist), ''), MAX(artist)), year, COUNT(*) as track_count, COALESCE(NULLIF(MAX(thumbnail_url), ''), MAX(cover_url), '')
 		FROM tracks
 		WHERE album != ''
-		GROUP BY album
+		GROUP BY album, COALESCE(NULLIF(album_artist, ''), artist), year
 		ORDER BY album ASC
 		LIMIT ? OFFSET ?
 	`, limit, offset)
@@ -1233,9 +1322,10 @@ func (d *DB) ListAlbums(ctx context.Context, offset, limit int) ([]*models.Album
 	var albums []*models.Album
 	for rows.Next() {
 		var a models.Album
-		if err := rows.Scan(&a.Title, &a.Artist, &a.Year, &a.TrackCount, &a.CoverURL); err != nil {
+		if err := rows.Scan(&a.Title, &a.Artist, &a.Year, &a.TrackCount, &a.ThumbnailURL); err != nil {
 			return nil, 0, err
 		}
+		a.CoverURL = a.ThumbnailURL
 		a.ID = fmt.Sprintf("album_%s", a.Title)
 		albums = append(albums, &a)
 	}
@@ -1249,7 +1339,7 @@ func (d *DB) GetArtistTracks(ctx context.Context, artist string, limit int) ([]*
 
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at,
-		       COALESCE(fingerprint, ''), COALESCE(cover_url, ''), COALESCE(thumb_url, ''),
+		       COALESCE(fingerprint, ''), COALESCE(thumbnail_url, ''), COALESCE(cover_url, ''),
 		       COALESCE(lyrics, ''), COALESCE(synced_lyrics, ''), COALESCE(year, 0)
 		FROM tracks
 		WHERE LOWER(artist) = LOWER(?)
@@ -1264,7 +1354,7 @@ func (d *DB) GetArtistTracks(ctx context.Context, artist string, limit int) ([]*
 	for rows.Next() {
 		var t models.Track
 		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-			&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
+			&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
 			return nil, err
 		}
 		tracks = append(tracks, &t)
@@ -1272,18 +1362,18 @@ func (d *DB) GetArtistTracks(ctx context.Context, artist string, limit int) ([]*
 	return tracks, rows.Err()
 }
 
-// GetAlbumTracks returns tracks by album.
+// GetAlbumTracks returns tracks by album ordered by disc and track number.
 func (d *DB) GetAlbumTracks(ctx context.Context, album string, limit int) ([]*models.Track, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at,
-		       COALESCE(fingerprint, ''), COALESCE(cover_url, ''), COALESCE(thumb_url, ''),
+		       COALESCE(fingerprint, ''), COALESCE(thumbnail_url, ''), COALESCE(cover_url, ''),
 		       COALESCE(lyrics, ''), COALESCE(synced_lyrics, ''), COALESCE(year, 0)
 		FROM tracks
 		WHERE LOWER(album) = LOWER(?)
-		ORDER BY id ASC LIMIT ?
+		ORDER BY disc_number ASC, track_number ASC, title ASC LIMIT ?
 	`, album, limit)
 	if err != nil {
 		return nil, err
@@ -1294,7 +1384,7 @@ func (d *DB) GetAlbumTracks(ctx context.Context, album string, limit int) ([]*mo
 	for rows.Next() {
 		var t models.Track
 		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-			&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
+			&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
 			return nil, err
 		}
 		tracks = append(tracks, &t)
@@ -1310,7 +1400,7 @@ func (d *DB) SearchTracks(ctx context.Context, query string, limit int) ([]*mode
 	param := "%" + strings.ToLower(query) + "%"
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at,
-		       COALESCE(fingerprint, ''), COALESCE(cover_url, ''), COALESCE(thumb_url, ''),
+		       COALESCE(fingerprint, ''), COALESCE(thumbnail_url, ''), COALESCE(cover_url, ''),
 		       COALESCE(lyrics, ''), COALESCE(synced_lyrics, ''), COALESCE(year, 0)
 		FROM tracks
 		WHERE LOWER(title) LIKE ? OR LOWER(artist) LIKE ? OR LOWER(album) LIKE ?
@@ -1325,7 +1415,7 @@ func (d *DB) SearchTracks(ctx context.Context, query string, limit int) ([]*mode
 	for rows.Next() {
 		var t models.Track
 		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-			&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
+			&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
 			return nil, err
 		}
 		tracks = append(tracks, &t)
@@ -1340,7 +1430,7 @@ func (d *DB) GetRandomTracks(ctx context.Context, limit int) ([]*models.Track, e
 
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT id, title, artist, album, duration_sec, mime_type, file_size, file_name, created_at,
-		       COALESCE(fingerprint, ''), COALESCE(cover_url, ''), COALESCE(thumb_url, ''),
+		       COALESCE(fingerprint, ''), COALESCE(thumbnail_url, ''), COALESCE(cover_url, ''),
 		       COALESCE(lyrics, ''), COALESCE(synced_lyrics, ''), COALESCE(year, 0)
 		FROM tracks
 		ORDER BY RANDOM() LIMIT ?
@@ -1354,7 +1444,7 @@ func (d *DB) GetRandomTracks(ctx context.Context, limit int) ([]*models.Track, e
 	for rows.Next() {
 		var t models.Track
 		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationSec, &t.MimeType, &t.FileSize, &t.FileName, &t.CreatedAt,
-			&t.Fingerprint, &t.CoverURL, &t.ThumbURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
+			&t.Fingerprint, &t.ThumbnailURL, &t.CoverURL, &t.Lyrics, &t.SyncedLyrics, &t.Year); err != nil {
 			return nil, err
 		}
 		tracks = append(tracks, &t)

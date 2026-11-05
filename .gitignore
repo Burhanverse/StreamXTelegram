@@ -4,6 +4,7 @@ apk_decompiled/
 .gradle/
 .kotlin/
 build/
+certs/
 *.md
 *.apk
 *.zip

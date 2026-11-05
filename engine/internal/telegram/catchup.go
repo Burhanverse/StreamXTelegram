@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -557,6 +558,12 @@ func (s *CatchupService) processMessage(ctx context.Context, msg *tg.Message, ch
 		return updated
 	}
 
+	if mediaDoc, ok := msg.Media.(*tg.MessageMediaDocument); ok && mediaDoc.Document != nil {
+		if doc, ok := mediaDoc.Document.(*tg.Document); ok {
+			s.saveTelegramThumbnail(ctx, doc, track.ID)
+		}
+	}
+
 	// 1. Tag & Filename Sanitization
 	cleanTitle, cleanArtist := metadata.CleanMetadata(track.Title, track.Artist)
 	track.Title = cleanTitle
@@ -696,7 +703,39 @@ func ExtractAudioTrack(msg *tg.Message, chatID int64) (*models.Track, *models.Tr
 		}
 	}
 
+	var bestThumbType string
+	var bestThumbSize int
+	for _, thumbClass := range doc.Thumbs {
+		switch t := thumbClass.(type) {
+		case *tg.PhotoCachedSize:
+			if bestThumbType == "" {
+				bestThumbType = "cached"
+			}
+		case *tg.PhotoSize:
+			if t.Size > bestThumbSize {
+				bestThumbSize = t.Size
+				bestThumbType = t.Type
+			}
+		case *tg.PhotoSizeProgressive:
+			maxSz := 0
+			for _, sz := range t.Sizes {
+				if sz > maxSz {
+					maxSz = sz
+				}
+			}
+			if maxSz > bestThumbSize {
+				bestThumbSize = maxSz
+				bestThumbType = t.Type
+			}
+		}
+	}
+
 	trackID := fmt.Sprintf("doc_%d", doc.ID)
+	var thumbURL string
+	if bestThumbType != "" {
+		thumbURL = fmt.Sprintf("content://com.music.streamx.extensions.telegram.source/art/%s", trackID)
+	}
+
 	createdAt := time.Unix(int64(msg.Date), 0)
 	if msg.Date == 0 {
 		createdAt = time.Now()
@@ -711,6 +750,7 @@ func ExtractAudioTrack(msg *tg.Message, chatID int64) (*models.Track, *models.Tr
 		MimeType:      doc.MimeType,
 		FileSize:      doc.Size,
 		FileName:      fileName,
+		ThumbnailURL:  thumbURL,
 		CreatedAt:     createdAt,
 		ChatID:        chatID,
 		MsgID:         int32(msg.ID),
@@ -734,6 +774,72 @@ func ExtractAudioTrack(msg *tg.Message, chatID int64) (*models.Track, *models.Tr
 	}
 
 	return track, source, loc
+}
+
+func (s *CatchupService) saveTelegramThumbnail(ctx context.Context, doc *tg.Document, trackID string) {
+	if s.enrichment == nil || doc == nil || trackID == "" {
+		return
+	}
+	artDir := s.enrichment.ArtworkDir()
+	if artDir == "" {
+		return
+	}
+	artFile := filepath.Join(artDir, trackID+".jpg")
+	if fi, err := os.Stat(artFile); err == nil && fi.Size() > 0 {
+		return
+	}
+
+	var bestThumbType string
+	var bestThumbSize int
+	var cachedBytes []byte
+
+	for _, thumbClass := range doc.Thumbs {
+		switch t := thumbClass.(type) {
+		case *tg.PhotoCachedSize:
+			if len(t.Bytes) > 0 {
+				cachedBytes = t.Bytes
+			}
+		case *tg.PhotoSize:
+			if t.Size > bestThumbSize {
+				bestThumbSize = t.Size
+				bestThumbType = t.Type
+			}
+		case *tg.PhotoSizeProgressive:
+			maxSz := 0
+			for _, sz := range t.Sizes {
+				if sz > maxSz {
+					maxSz = sz
+				}
+			}
+			if maxSz > bestThumbSize {
+				bestThumbSize = maxSz
+				bestThumbType = t.Type
+			}
+		}
+	}
+
+	if len(cachedBytes) > 0 {
+		_ = os.WriteFile(artFile, cachedBytes, 0644)
+		return
+	}
+
+	if bestThumbType != "" {
+		primary := s.pool.Primary()
+		if primary != nil && primary.Ready {
+			thumbLoc := &tg.InputDocumentFileLocation{
+				ID:            doc.ID,
+				AccessHash:    doc.AccessHash,
+				FileReference: doc.FileReference,
+				ThumbSize:     bestThumbType,
+			}
+			dlCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			thumbData, err := primary.DownloadChunk(dlCtx, thumbLoc, 0, 131072)
+			cancel()
+			if err == nil && len(thumbData) > 0 {
+				_ = os.WriteFile(artFile, thumbData, 0644)
+			}
+		}
+	}
 }
 
 func isAudioExt(filename string) bool {

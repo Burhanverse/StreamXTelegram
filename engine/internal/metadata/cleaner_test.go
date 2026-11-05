@@ -70,6 +70,18 @@ func TestStripNoise(t *testing.T) {
 			"Track Name (Unclosed bracket",
 			"Track Name Unclosed bracket",
 		},
+		{
+			"01. Bohemian Rhapsody",
+			"Bohemian Rhapsody",
+		},
+		{
+			"01/12 - Hotel California",
+			"Hotel California",
+		},
+		{
+			"02) Stairway to Heaven [FLAC]",
+			"Stairway to Heaven",
+		},
 	}
 
 	for _, tt := range tests {

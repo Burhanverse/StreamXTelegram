@@ -31,6 +31,14 @@ func TestExtractAudioTrack(t *testing.T) {
 				FileReference: []byte("ref_audio"),
 				Size:          8 * 1024 * 1024,
 				MimeType:      "audio/flac",
+				Thumbs: []tg.PhotoSizeClass{
+					&tg.PhotoCachedSize{
+						Type:  "s",
+						W:     100,
+						H:     100,
+						Bytes: []byte("test_thumb_bytes"),
+					},
+				},
 				Attributes: []tg.DocumentAttributeClass{
 					&tg.DocumentAttributeAudio{
 						Title:     "Bohemian Rhapsody",
@@ -61,6 +69,10 @@ func TestExtractAudioTrack(t *testing.T) {
 	}
 	if track.FileSize != 8*1024*1024 {
 		t.Errorf("Expected file size 8MB, got %d", track.FileSize)
+	}
+	expectedArt := "content://com.music.streamx.extensions.telegram.source/art/doc_9001"
+	if track.ThumbnailURL != expectedArt {
+		t.Errorf("Expected ThumbnailURL '%s', got '%s'", expectedArt, track.ThumbnailURL)
 	}
 	if source.TopicID != 555 {
 		t.Errorf("Expected topic ID 555, got %d", source.TopicID)

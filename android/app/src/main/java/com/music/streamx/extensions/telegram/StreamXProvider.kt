@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.Process
 import android.os.storage.StorageManager
 import android.system.ErrnoException
@@ -39,6 +40,13 @@ class StreamXProvider : ContentProvider() {
     companion object {
         private const val TAG = "StreamXTelegramProvider"
         const val AUTHORITY = BuildConfig.PROVIDER_AUTHORITY
+        const val ARTWORK_DIR_NAME = "artwork"
+
+        fun getArtworkDirName(): String = try {
+            Engine.getArtworkDirName()
+        } catch (_: Throwable) {
+            ARTWORK_DIR_NAME
+        }
     }
 
     private val proxyThread by lazy {
@@ -50,6 +58,16 @@ class StreamXProvider : ContentProvider() {
 
         Log.i(TAG, "Initializing StreamXProvider with authority $AUTHORITY")
         val ctx = context?.applicationContext ?: return true
+
+        // Clean up legacy covers directory (Prompt 5 requirement: single shared artwork path, delete legacy path)
+        try {
+            val oldCoversDir = java.io.File(ctx.filesDir, "covers")
+            if (oldCoversDir.exists()) {
+                oldCoversDir.deleteRecursively()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to clean legacy covers directory: ${e.message}")
+        }
 
         // Register event listener for engine notifications
         Engine.setEventCallback(object : EventCallback {
@@ -71,6 +89,26 @@ class StreamXProvider : ContentProvider() {
             }
         })
 
+
+        // Register screen state receiver for diagnostic tagging (screen-on vs screen-off)
+        try {
+            val powerManager = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            Engine.setScreenOn(powerManager?.isInteractive ?: true)
+            val screenFilter = android.content.IntentFilter().apply {
+                addAction(android.content.Intent.ACTION_SCREEN_ON)
+                addAction(android.content.Intent.ACTION_SCREEN_OFF)
+            }
+            ctx.registerReceiver(object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: android.content.Intent?) {
+                    when (intent?.action) {
+                        android.content.Intent.ACTION_SCREEN_ON -> Engine.setScreenOn(true)
+                        android.content.Intent.ACTION_SCREEN_OFF -> Engine.setScreenOn(false)
+                    }
+                }
+            }, screenFilter)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register screen state receiver: ${e.message}")
+        }
 
         // Background start if credentials exist
         Thread {
@@ -95,7 +133,7 @@ class StreamXProvider : ContentProvider() {
 
         return try {
             val result = Engine.start(filesDir, cacheDir, configJson)
-            Log.i(TAG, "Engine started on 127.0.0.1:${result.port}")
+            Log.i(TAG, "Engine started on HTTP 127.0.0.1:${result.port}, HTTPS 127.0.0.1:${result.httpsPort}")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start engine: ${e.message}")
@@ -273,23 +311,45 @@ class StreamXProvider : ContentProvider() {
         val callingUid = Binder.getCallingUid()
         val callerPkg = callingPackage
         val ctx = context ?: throw IllegalStateException("Provider context is null")
-        CallerVerifier.verifyCaller(ctx, callingUid, callerPkg)
+
+        val segments = uri.pathSegments
+        val isArt = segments.isNotEmpty() && segments[0] == "art"
+        val trackId = if (segments.size >= 2) segments[1] else ""
+
+        if (isArt) {
+            Log.d(TAG, "ART request received: trackId=$trackId, callerPkg=$callerPkg, uid=$callingUid")
+            LogBuffer.add("ART", "Request received: trackId=$trackId, callerPkg=$callerPkg, uid=$callingUid")
+        }
+
+        try {
+            CallerVerifier.verifyCaller(ctx, callingUid, callerPkg)
+        } catch (e: SecurityException) {
+            if (isArt) {
+                Log.w(TAG, "ART verifier rejection: callerPkg=$callerPkg, uid=$callingUid: ${e.message}")
+                LogBuffer.add("ART", "Verifier rejection: callerPkg=$callerPkg, uid=$callingUid: ${e.message}")
+            }
+            throw e
+        }
 
         if (mode != "r") {
             throw SecurityException("Only read-only mode 'r' is supported, requested: $mode")
         }
 
-        val segments = uri.pathSegments
         if (segments.size < 2 || (segments[0] != "track" && segments[0] != "art")) {
             throw FileNotFoundException("Unsupported URI path: ${uri.path}")
         }
-        val trackId = segments[1]
 
-        if (segments[0] == "art") {
-            val coverFile = java.io.File(ctx.filesDir, "covers/$trackId.jpg")
+        if (isArt) {
+            val artworkDir = getArtworkDirName()
+            val coverFile = java.io.File(ctx.filesDir, "$artworkDir/$trackId.jpg")
             if (coverFile.exists() && coverFile.length() > 0) {
+                val bytes = coverFile.length()
+                Log.d(TAG, "ART file served: trackId=$trackId, bytes=$bytes")
+                LogBuffer.add("ART", "File served: trackId=$trackId, bytes=$bytes")
                 return ParcelFileDescriptor.open(coverFile, ParcelFileDescriptor.MODE_READ_ONLY)
             }
+            Log.w(TAG, "ART file missing: ${coverFile.absolutePath} (trackId=$trackId)")
+            LogBuffer.add("ART", "File missing: ${coverFile.absolutePath} (trackId=$trackId)")
             throw FileNotFoundException("Cover art not found for track: $trackId")
         }
 
@@ -326,6 +386,10 @@ class StreamXProvider : ContentProvider() {
                 override fun onRead(offset: Long, size: Int, data: ByteArray): Int {
                     if (offset >= trackSize || size <= 0) {
                         return 0
+                    }
+                    val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    if (pm != null) {
+                        Engine.setScreenOn(pm.isInteractive)
                     }
                     return try {
                         val chunk = Engine.readStream(handle, offset, size.toLong())
@@ -379,12 +443,18 @@ class StreamXProvider : ContentProvider() {
         return sb.toString()
     }
 
-    override fun getType(uri: Uri): String? {
-        val segments = uri.pathSegments
+    fun getTypeForSegments(segments: List<String>): String? {
+        if (segments.isNotEmpty() && segments[0] == "art") {
+            return "image/jpeg"
+        }
         if (segments.size >= 2 && segments[0] == "track") {
             return "audio/mpeg"
         }
         return null
+    }
+
+    override fun getType(uri: Uri): String? {
+        return getTypeForSegments(uri.pathSegments)
     }
 
     override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = throw UnsupportedOperationException()

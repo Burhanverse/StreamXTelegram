@@ -29,7 +29,6 @@ type Pool struct {
 	primaryWorker    *ClientWorker
 	secondaryWorkers []*ClientWorker
 	allWorkers       []*ClientWorker
-	statsListener    WorkerStatsListener
 	roundRobin       uint64
 	mu               sync.RWMutex
 	cancel           context.CancelFunc
@@ -243,15 +242,7 @@ func (p *Pool) ReadyWorkerCount() int {
 	return count
 }
 
-// SetStatsListener registers a telemetry stats listener across all workers in the pool.
-func (p *Pool) SetStatsListener(l WorkerStatsListener) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.statsListener = l
-	for _, w := range p.allWorkers {
-		w.SetStatsListener(l)
-	}
-}
+
 
 // IsReady returns true if the primary bot is authenticated and connected.
 func (p *Pool) IsReady() bool {
@@ -333,6 +324,10 @@ func (p *Pool) DispatchChunkDownload(
 	offset int64,
 	limit int,
 ) ([]byte, error) {
+	dispatchStart := time.Now()
+	isBg := models.IsBackgroundContext(ctx)
+	var waitDur time.Duration
+
 	priority := models.PriorityFromContext(ctx)
 	p.mu.RLock()
 	workerCount := len(p.allWorkers)
@@ -356,6 +351,11 @@ func (p *Pool) DispatchChunkDownload(
 		worker := p.AcquireWorkerWithPriority(priority)
 		if worker == nil || !worker.Ready {
 			return nil, ErrWorkerNotReady
+		}
+
+		rem := worker.CooldownRemaining()
+		if rem > 0 {
+			waitDur += rem
 		}
 
 		// Avoid immediately retrying the same worker if other workers exist
@@ -385,6 +385,11 @@ func (p *Pool) DispatchChunkDownload(
 		chunk, err := worker.DownloadChunk(ctx, location, offset, limit)
 		if err == nil {
 			worker.MarkSuccess()
+			dispatchDur := time.Since(dispatchStart)
+			if isBg && dispatchDur > 3*time.Second {
+				log.Warnf("[BG-DISPATCH-SLOW] chat=%d msg=%d offset=%d limit=%d total=%v wait=%v attempts=%d",
+					chatID, msgID, offset, limit, dispatchDur, waitDur, len(triedWorkers))
+			}
 			return chunk, nil
 		}
 
@@ -405,11 +410,22 @@ func (p *Pool) DispatchChunkDownload(
 				chunk, retryErr := worker.DownloadChunk(ctx, freshLoc, offset, limit)
 				if retryErr == nil {
 					worker.MarkSuccess()
+					dispatchDur := time.Since(dispatchStart)
+					if isBg && dispatchDur > 3*time.Second {
+						log.Warnf("[BG-DISPATCH-SLOW] chat=%d msg=%d offset=%d limit=%d total=%v wait=%v attempts=%d",
+							chatID, msgID, offset, limit, dispatchDur, waitDur, len(triedWorkers))
+					}
 					return chunk, nil
 				}
 				lastErr = retryErr
 			}
 		}
+	}
+
+	dispatchDur := time.Since(dispatchStart)
+	if isBg && dispatchDur > 3*time.Second {
+		log.Warnf("[BG-DISPATCH-SLOW] chat=%d msg=%d offset=%d limit=%d total=%v wait=%v attempts=%d err=%v",
+			chatID, msgID, offset, limit, dispatchDur, waitDur, len(triedWorkers), lastErr)
 	}
 
 	if lastErr != nil {

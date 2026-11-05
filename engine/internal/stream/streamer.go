@@ -14,57 +14,36 @@ import (
 
 	"github.com/gotd/td/tg"
 
+	"musix/engine/internal/config"
+	"musix/engine/internal/logger"
 	"musix/engine/internal/models"
 	"musix/engine/internal/telegram"
 )
 
-const (
-	defaultChunkSize = 1024 * 1024 // 1 MB (Telegram MTProto maximum limit for upload.getFile)
-	oneMB            = 1024 * 1024
-)
+var logStream = logger.New("stream")
+
+const oneMB = 1024 * 1024
 
 // Streamer handles HTTP byte-range audio streaming from Telegram with multi-bot parallel prefetching.
 type Streamer struct {
 	client        telegram.Client
 	prefetchCache *PrefetchCache
-	diagnostics   *StreamDiagnostics
-	diagMu        sync.RWMutex
+	bgCache       *BgChunkCache
 
 	sessions      map[int64]*StreamSession
 	sessionsMu    sync.RWMutex
 	nextSessionID int64
-}
 
-type telemetryBridge struct {
-	diag *StreamDiagnostics
-}
-
-func (tb *telemetryBridge) RecordDownload(ctx context.Context, botIndex int, offset int64, limit int, duration time.Duration, err error) {
-	if tb.diag != nil {
-		trackID := TrackIDFromContext(ctx)
-		tb.diag.RecordBotDownload(trackID, botIndex, duration, err)
-	}
-}
-
-func (tb *telemetryBridge) RecordFloodWait(ctx context.Context, botIndex int, wait time.Duration) {
-	if tb.diag != nil {
-		trackID := TrackIDFromContext(ctx)
-		tb.diag.RecordFloodWait(trackID, botIndex, wait)
-	}
-}
-
-func (tb *telemetryBridge) RecordError(ctx context.Context, botIndex int, errType string) {
-	if tb.diag != nil {
-		trackID := TrackIDFromContext(ctx)
-		tb.diag.RecordError(trackID, errType)
-	}
+	activePlaybackReads      int64
+	lastPlaybackReadUnixNano int64
 }
 
 // NewStreamer creates a new audio streamer with parallel chunk prefetching.
 func NewStreamer(client telegram.Client) *Streamer {
 	return &Streamer{
 		client:        client,
-		prefetchCache: NewPrefetchCache(16),
+		prefetchCache: NewPrefetchCache(config.PrefetchCacheCapacity),
+		bgCache:       NewBgChunkCache(config.BgCacheCapacity),
 		sessions:      make(map[int64]*StreamSession),
 	}
 }
@@ -89,6 +68,10 @@ func (s *Streamer) OpenStream(ctx context.Context, trackID string) (int64, error
 
 // ReadStream reads up to length bytes at offset from the open session designated by handle.
 func (s *Streamer) ReadStream(handle int64, offset int64, length int) ([]byte, error) {
+	atomic.AddInt64(&s.activePlaybackReads, 1)
+	defer atomic.AddInt64(&s.activePlaybackReads, -1)
+	atomic.StoreInt64(&s.lastPlaybackReadUnixNano, time.Now().UnixNano())
+
 	s.sessionsMu.RLock()
 	session, ok := s.sessions[handle]
 	s.sessionsMu.RUnlock()
@@ -121,47 +104,24 @@ func (s *Streamer) ActiveSessionCount() int {
 	return len(s.sessions)
 }
 
-// IsPlaybackActive returns true if any playback session is currently open.
+// IsPlaybackActive returns true if playback chunks are actively in-flight or data was read within the last 3 seconds.
+// This allows background workers to proceed when descriptors remain open for paused or preloaded tracks.
 func (s *Streamer) IsPlaybackActive() bool {
-	return s.ActiveSessionCount() > 0
-}
-
-// SetDiagnostics enables or attaches streaming telemetry diagnostics.
-func (s *Streamer) SetDiagnostics(diag *StreamDiagnostics) {
-	s.diagMu.Lock()
-	defer s.diagMu.Unlock()
-	s.diagnostics = diag
-	if pool, ok := s.client.(*telegram.Pool); ok && diag != nil {
-		pool.SetStatsListener(&telemetryBridge{diag: diag})
+	if atomic.LoadInt64(&s.activePlaybackReads) > 0 {
+		return true
 	}
-}
-
-// Diagnostics returns the active telemetry diagnostics recorder if attached.
-func (s *Streamer) Diagnostics() *StreamDiagnostics {
-	s.diagMu.RLock()
-	defer s.diagMu.RUnlock()
-	return s.diagnostics
+	lastRead := atomic.LoadInt64(&s.lastPlaybackReadUnixNano)
+	if lastRead > 0 && time.Since(time.Unix(0, lastRead)) < 3*time.Second {
+		return true
+	}
+	return false
 }
 
 // StartSession initiates an active playback session for trackID.
-func (s *Streamer) StartSession(trackID string) {
-	s.diagMu.RLock()
-	diag := s.diagnostics
-	s.diagMu.RUnlock()
-	if diag != nil {
-		diag.StartSession(trackID)
-	}
-}
+func (s *Streamer) StartSession(trackID string) {}
 
-// ReleaseSession terminates the active playback session for trackID and outputs summary telemetry.
-func (s *Streamer) ReleaseSession(trackID string) {
-	s.diagMu.RLock()
-	diag := s.diagnostics
-	s.diagMu.RUnlock()
-	if diag != nil {
-		diag.ReleaseSession(trackID)
-	}
-}
+// ReleaseSession terminates the active playback session for trackID.
+func (s *Streamer) ReleaseSession(trackID string) {}
 
 // GetTrackSize returns the total file size in bytes for a track, or an error if not found.
 func (s *Streamer) GetTrackSize(ctx context.Context, trackID string) (int64, error) {
@@ -177,13 +137,7 @@ func (s *Streamer) GetTrackSize(ctx context.Context, trackID string) (int64, err
 
 func (s *Streamer) downloadChunk(ctx context.Context, track *models.Track, location *tg.InputDocumentFileLocation, offset int64, limit int) ([]byte, error) {
 	if track != nil {
-		ctx = WithTrackID(ctx, track.ID)
-		s.diagMu.RLock()
-		diag := s.diagnostics
-		s.diagMu.RUnlock()
-		if diag != nil {
-			diag.RecordChunkRequest(track.ID, offset)
-		}
+		ctx = models.WithTrackID(ctx, track.ID)
 	}
 	if pool, ok := s.client.(*telegram.Pool); ok && track != nil && track.ChatID != 0 && track.MsgID != 0 {
 		return pool.DispatchChunkDownload(ctx, track.ChatID, track.MsgID, offset, limit)
@@ -199,7 +153,7 @@ func (s *Streamer) triggerPrefetch(track *models.Track, location *tg.InputDocume
 		prefetchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if track != nil {
-			prefetchCtx = WithTrackID(prefetchCtx, track.ID)
+			prefetchCtx = models.WithTrackID(prefetchCtx, track.ID)
 		}
 		preChunk, preErr := s.downloadChunk(prefetchCtx, track, location, offset, limit)
 		if preErr == nil && len(preChunk) > 0 {
@@ -214,55 +168,9 @@ func (s *Streamer) ReadHeader(ctx context.Context, trackID string, maxBytes int)
 	if maxBytes <= 0 {
 		maxBytes = 256 * 1024
 	}
-	// Align to 4096 (4 KB boundary for MTProto), max 1 MB
-	limit := ((maxBytes + 4095) / 4096) * 4096
-	if limit > defaultChunkSize {
-		limit = defaultChunkSize
-	}
-
 	ctx = models.WithBackground(ctx)
 	ctx = models.WithPriority(ctx, models.PriorityBackground)
-	ctx = models.WithTrackID(ctx, trackID)
-
-	s.diagMu.RLock()
-	diag := s.diagnostics
-	s.diagMu.RUnlock()
-	if diag != nil {
-		diag.RecordBackgroundRead()
-	}
-
-	track, err := s.client.ResolveTrack(ctx, trackID)
-	if err != nil || track == nil {
-		return nil, fmt.Errorf("track not found: %s", trackID)
-	}
-
-	var location *tg.InputDocumentFileLocation
-	if track.FileID != "" {
-		if decoded, err := telegram.DecodeFileID(track.FileID); err == nil {
-			location = &tg.InputDocumentFileLocation{
-				ID:            decoded.MediaID,
-				AccessHash:    decoded.AccessHash,
-				FileReference: decoded.FileReference,
-			}
-		}
-	}
-	if location == nil {
-		var docID int64
-		if strings.HasPrefix(track.ID, "doc_") {
-			docID, _ = strconv.ParseInt(strings.TrimPrefix(track.ID, "doc_"), 10, 64)
-		}
-		if docID == 0 {
-			docID = track.AccessHash
-		}
-		location = &tg.InputDocumentFileLocation{
-			ID:            docID,
-			AccessHash:    track.AccessHash,
-			FileReference: track.FileReference,
-		}
-	}
-
-	// Direct chunk download without prefetch or prefetchCache mutation
-	return s.downloadChunk(ctx, track, location, 0, limit)
+	return s.ReadChunk(ctx, trackID, 0, maxBytes)
 }
 
 // ReadChunk reads up to limit bytes starting at offset for trackID directly from Telegram/cache.
@@ -272,18 +180,17 @@ func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, 
 	}
 
 	readStart := time.Now()
-	isBg := IsBackgroundContext(ctx)
-	if isBg {
-		s.diagMu.RLock()
-		diag := s.diagnostics
-		s.diagMu.RUnlock()
-		if diag != nil {
-			diag.RecordBackgroundRead()
-		}
+	isBg := models.IsBackgroundContext(ctx)
+	if !isBg {
+		atomic.AddInt64(&s.activePlaybackReads, 1)
+		defer atomic.AddInt64(&s.activePlaybackReads, -1)
+		atomic.StoreInt64(&s.lastPlaybackReadUnixNano, time.Now().UnixNano())
 	}
-	ctx = WithTrackID(ctx, trackID)
+	ctx = models.WithTrackID(ctx, trackID)
 
+	resolveStart := time.Now()
 	track, err := s.client.ResolveTrack(ctx, trackID)
+	resolveDur := time.Since(resolveStart)
 	if err != nil || track == nil {
 		return nil, fmt.Errorf("track not found: %s", trackID)
 	}
@@ -328,6 +235,8 @@ func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, 
 		bytesRemaining = totalSize - currentOffset
 	}
 
+	var totalDlDur time.Duration
+
 	for bytesRemaining > 0 {
 		select {
 		case <-ctx.Done():
@@ -335,24 +244,74 @@ func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, 
 		default:
 		}
 
+		if isBg {
+			var chunk []byte
+			var found bool
+			if s.bgCache != nil {
+				chunk, found = s.bgCache.GetRange(track.ID, currentOffset)
+			}
+
+			if !found {
+				chunkOffset := (currentOffset / 4096) * 4096
+				skipBytes := currentOffset - chunkOffset
+
+				needed := bytesRemaining + skipBytes
+				if needed > config.MaxBgBlockSize {
+					needed = config.MaxBgBlockSize
+				}
+
+				// Align to 4096 bytes for MTProto limit
+				alignedLimit := int(((needed + 4095) / 4096) * 4096)
+				if alignedLimit > config.MaxBgBlockSize {
+					alignedLimit = config.MaxBgBlockSize
+				}
+				if chunkOffset+int64(alignedLimit) > totalSize {
+					alignedLimit = int(totalSize - chunkOffset)
+				}
+
+				dlStart := time.Now()
+				var err error
+				dlChunk, err := s.downloadChunk(ctx, track, location, chunkOffset, alignedLimit)
+				totalDlDur += time.Since(dlStart)
+				if err != nil {
+					if len(result) > 0 {
+						return result, nil
+					}
+					return nil, err
+				}
+				if len(dlChunk) == 0 {
+					break
+				}
+				if s.bgCache != nil {
+					s.bgCache.Put(track.ID, chunkOffset, dlChunk)
+				}
+				if skipBytes >= int64(len(dlChunk)) {
+					break
+				}
+				chunk = dlChunk[skipBytes:]
+			}
+
+			toTake := bytesRemaining
+			if toTake > int64(len(chunk)) {
+				toTake = int64(len(chunk))
+			}
+			result = append(result, chunk[:toTake]...)
+			bytesRemaining -= toTake
+			currentOffset += toTake
+			continue
+		}
+
+		// Interactive playback path
 		chunkOffset := (currentOffset / 4096) * 4096
 		skipBytes := currentOffset - chunkOffset
 
 		bytesToBoundary := int64(oneMB) - (chunkOffset % int64(oneMB))
-		currentLimit := defaultChunkSize
+		currentLimit := config.DefaultChunkSize
 		if int64(currentLimit) > bytesToBoundary {
 			currentLimit = int(bytesToBoundary)
 		}
 
 		chunk, found := s.prefetchCache.Get(track.ID, chunkOffset, currentLimit)
-		if !isBg {
-			s.diagMu.RLock()
-			diag := s.diagnostics
-			s.diagMu.RUnlock()
-			if diag != nil {
-				diag.RecordCacheAccess(track.ID, found)
-			}
-		}
 		if !found {
 			var err error
 			chunk, err = s.downloadChunk(ctx, track, location, chunkOffset, currentLimit)
@@ -369,11 +328,11 @@ func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, 
 			break
 		}
 
-		// Asynchronous prefetch for next 2 chunks (1MB each)
+		// Asynchronous prefetch for next 2 chunks (1MB each) - only for interactive playback
 		nextOffset := chunkOffset + int64(rawLen)
 		if nextOffset < totalSize {
 			nextBytesToBoundary := int64(oneMB) - (nextOffset % int64(oneMB))
-			nextLimit := defaultChunkSize
+			nextLimit := config.DefaultChunkSize
 			if int64(nextLimit) > nextBytesToBoundary {
 				nextLimit = int(nextBytesToBoundary)
 			}
@@ -382,7 +341,7 @@ func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, 
 			secondOffset := nextOffset + int64(nextLimit)
 			if secondOffset < totalSize {
 				secondBytesToBoundary := int64(oneMB) - (secondOffset % int64(oneMB))
-				secondLimit := defaultChunkSize
+				secondLimit := config.DefaultChunkSize
 				if int64(secondLimit) > secondBytesToBoundary {
 					secondLimit = int(secondBytesToBoundary)
 				}
@@ -413,13 +372,9 @@ func (s *Streamer) ReadChunk(ctx context.Context, trackID string, offset int64, 
 	}
 
 	readDuration := time.Since(readStart)
-	if !isBg {
-		s.diagMu.RLock()
-		diag := s.diagnostics
-		s.diagMu.RUnlock()
-		if diag != nil {
-			diag.RecordRead(trackID, limit, readDuration, len(result))
-		}
+	if isBg && readDuration > 3*time.Second {
+		logStream.Warnf("[BG-READ-SLOW] track=%s offset=%d limit=%d total=%v resolve=%v dl=%v",
+			trackID, offset, limit, readDuration, resolveDur, totalDlDur)
 	}
 
 	return result, nil
@@ -550,7 +505,7 @@ func (s *Streamer) streamChunks(
 
 		// Calculate limit up to 1MB boundary
 		bytesToBoundary := int64(oneMB) - (chunkOffset % int64(oneMB))
-		currentLimit := defaultChunkSize
+		currentLimit := config.DefaultChunkSize
 		if int64(currentLimit) > bytesToBoundary {
 			currentLimit = int(bytesToBoundary)
 		}
@@ -577,7 +532,7 @@ func (s *Streamer) streamChunks(
 		nextOffset := chunkOffset + int64(rawLen)
 		if nextOffset < totalSize {
 			nextBytesToBoundary := int64(oneMB) - (nextOffset % int64(oneMB))
-			nextLimit := defaultChunkSize
+			nextLimit := config.DefaultChunkSize
 			if int64(nextLimit) > nextBytesToBoundary {
 				nextLimit = int(nextBytesToBoundary)
 			}
@@ -586,7 +541,7 @@ func (s *Streamer) streamChunks(
 			secondOffset := nextOffset + int64(nextLimit)
 			if secondOffset < totalSize {
 				secondBytesToBoundary := int64(oneMB) - (secondOffset % int64(oneMB))
-				secondLimit := defaultChunkSize
+				secondLimit := config.DefaultChunkSize
 				if int64(secondLimit) > secondBytesToBoundary {
 					secondLimit = int(secondBytesToBoundary)
 				}

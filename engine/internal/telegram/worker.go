@@ -21,13 +21,6 @@ var (
 	ErrWorkerNotReady       = errors.New("worker client is not ready")
 )
 
-// WorkerStatsListener enables recording MTProto download latencies, flood waits, and errors.
-type WorkerStatsListener interface {
-	RecordDownload(ctx context.Context, botIndex int, offset int64, limit int, duration time.Duration, err error)
-	RecordFloodWait(ctx context.Context, botIndex int, wait time.Duration)
-	RecordError(ctx context.Context, botIndex int, errType string)
-}
-
 // ClientWorker manages a single MTProto client connection in the pool.
 type ClientWorker struct {
 	ID                  int64
@@ -43,18 +36,12 @@ type ClientWorker struct {
 	Client              *telegram.Client
 	API                 *tg.Client
 	db                  *database.DB
-	statsListener       WorkerStatsListener
 
 	channelAccessHashes map[int64]int64
 	channelAccessMu     sync.RWMutex
 
 	locationCache       map[int32]*models.WorkerLocation
 	locationMu          sync.RWMutex
-}
-
-// SetStatsListener attaches a telemetry collector to this worker.
-func (w *ClientWorker) SetStatsListener(l WorkerStatsListener) {
-	w.statsListener = l
 }
 
 // IsCoolingDown returns true if the worker is currently undergoing a FLOOD_WAIT or circuit cooldown.
@@ -222,15 +209,7 @@ func (w *ClientWorker) FetchFileLocation(ctx context.Context, chatID int64, msgI
 			ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: int(msgID)}},
 		})
 		if err != nil {
-			if strings.Contains(strings.ToUpper(err.Error()), "FILE_MIGRATE") {
-				if w.statsListener != nil {
-					w.statsListener.RecordError(ctx, w.Index, "FILE_MIGRATE")
-				}
-			}
 			if wait, isFlood := ParseFloodWait(err); isFlood {
-				if w.statsListener != nil {
-					w.statsListener.RecordFloodWait(ctx, w.Index, wait)
-				}
 				log.Warnf("Worker #%d hit FLOOD_WAIT (%v) fetching message %d", w.Index, wait, msgID)
 				_ = SleepWithContext(ctx, wait)
 			}
@@ -333,37 +312,22 @@ func (w *ClientWorker) DownloadChunk(ctx context.Context, location *tg.InputDocu
 	var err error
 
 	for attempt := 0; attempt < 3; attempt++ {
-		start := time.Now()
 		res, err = w.API.UploadGetFile(ctx, req)
-		dur := time.Since(start)
-
-		if w.statsListener != nil {
-			w.statsListener.RecordDownload(ctx, w.Index, alignedOffset, limit, dur, err)
-		}
-
 		if err == nil {
 			break
 		}
 
 		if strings.Contains(strings.ToUpper(err.Error()), "FILE_REFERENCE") {
-			if w.statsListener != nil {
-				w.statsListener.RecordError(ctx, w.Index, "FILE_REFERENCE_EXPIRED")
-			}
 			return nil, ErrFileReferenceExpired
 		}
 
 		if strings.Contains(strings.ToUpper(err.Error()), "FILE_MIGRATE") {
-			if w.statsListener != nil {
-				w.statsListener.RecordError(ctx, w.Index, "FILE_MIGRATE")
-			}
 		}
 
 		if wait, isFlood := ParseFloodWait(err); isFlood {
 			w.MarkCooldown(wait)
-			if w.statsListener != nil {
-				w.statsListener.RecordFloodWait(ctx, w.Index, wait)
-			}
-			log.Warnf("Worker #%d UploadGetFile hit FLOOD_WAIT (%v) at offset %d", w.Index, wait, offset)
+			isBg := models.IsBackgroundContext(ctx)
+			log.Warnf("Worker #%d UploadGetFile hit FLOOD_WAIT (%v) at offset %d (bg=%v)", w.Index, wait, offset, isBg)
 			priority := models.PriorityFromContext(ctx)
 			if priority == models.PriorityPlayback && wait > 1*time.Second {
 				// Do not block playback hot path; route to another worker immediately

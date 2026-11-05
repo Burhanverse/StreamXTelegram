@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"net/http"
@@ -22,112 +23,6 @@ import (
 )
 
 var logEnrich = logger.New("enrichment")
-
-// CandidateItem represents candidate details from an external music metadata provider.
-type CandidateItem struct {
-	Title       string `json:"title"`
-	Artist      string `json:"artist"`
-	DurationSec int    `json:"duration_sec"`
-}
-
-// ProviderLog captures queries sent and candidates returned for a specific provider.
-type ProviderLog struct {
-	Queries    []string        `json:"queries"`
-	Candidates []CandidateItem `json:"candidates"`
-}
-
-// DecisionLogDetails records the accepted result and rule used.
-type DecisionLogDetails struct {
-	Provider          string         `json:"provider"` // "jiosaavn", "itunes", "deezer", "embedded", "none"
-	Rule              string         `json:"rule"`     // "exact", "partial", "fallback", "embedded", "none"
-	AcceptedCandidate *CandidateItem `json:"accepted_candidate,omitempty"`
-}
-
-// EnrichmentRecord represents one track enrichment log entry.
-type EnrichmentRecord struct {
-	Timestamp     string                 `json:"timestamp"`
-	TrackID       string                 `json:"track_id"`
-	RawTags       map[string]string      `json:"raw_tags"`
-	RawFilename   string                 `json:"raw_filename"`
-	Cleaned       map[string]string      `json:"cleaned"`
-	QueriesSent   []string               `json:"queries_sent"`
-	Providers     map[string]ProviderLog `json:"providers"`
-	Decision      DecisionLogDetails     `json:"decision"`
-	FinalCoverURL string                 `json:"final_cover_url"`
-}
-
-type enrichmentRotatedFile struct {
-	mu       sync.Mutex
-	path     string
-	maxBytes int64
-}
-
-func newEnrichmentRotatedFile(path string, maxBytes int64) *enrichmentRotatedFile {
-	_ = os.MkdirAll(filepath.Dir(path), 0755)
-	return &enrichmentRotatedFile{
-		path:     path,
-		maxBytes: maxBytes,
-	}
-}
-
-func (rf *enrichmentRotatedFile) Append(data []byte) error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	fi, err := os.Stat(rf.path)
-	if err == nil && fi.Size()+int64(len(data))+1 > rf.maxBytes {
-		backupPath := rf.path + ".1"
-		_ = os.Remove(backupPath)
-		_ = os.Rename(rf.path, backupPath)
-	}
-
-	f, err := os.OpenFile(rf.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if _, err := f.Write(data); err != nil {
-		return err
-	}
-	_, err = f.Write([]byte("\n"))
-	return err
-}
-
-type enrichmentRingBuffer struct {
-	mu       sync.RWMutex
-	capacity int
-	lines    []string
-}
-
-func newEnrichmentRingBuffer(capacity int) *enrichmentRingBuffer {
-	return &enrichmentRingBuffer{
-		capacity: capacity,
-		lines:    make([]string, 0, capacity),
-	}
-}
-
-func (rb *enrichmentRingBuffer) Add(line string) {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	if len(rb.lines) >= rb.capacity {
-		rb.lines = rb.lines[1:]
-	}
-	rb.lines = append(rb.lines, line)
-}
-
-func (rb *enrichmentRingBuffer) Get(limit int) []string {
-	rb.mu.RLock()
-	defer rb.mu.RUnlock()
-	n := len(rb.lines)
-	if limit <= 0 || limit > n {
-		limit = n
-	}
-	start := n - limit
-	result := make([]string, limit)
-	copy(result, rb.lines[start:])
-	return result
-}
 
 // LyricsResult holds lyrics retrieved from external providers.
 type LyricsResult struct {
@@ -207,10 +102,6 @@ type EnrichmentService struct {
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
 	mu               sync.RWMutex
-	coverCache       sync.Map
-	debugEnabled     bool
-	enrichLogFile    *enrichmentRotatedFile
-	enrichRingBuffer *enrichmentRingBuffer
 
 	isPlaybackActive func() bool
 	isSyncing        func() bool
@@ -264,19 +155,6 @@ func (s *EnrichmentService) SetSyncChecker(fn func() bool) {
 	s.isSyncing = fn
 }
 
-// GetCachedCover returns the in-memory cached HTTPS artwork URL for a title and artist if available.
-func (s *EnrichmentService) GetCachedCover(title, artist string) string {
-	cleanTitle := metadata.StripNoise(title)
-	cleanArtist := metadata.StripNoise(artist)
-	key := strings.ToLower(fmt.Sprintf("%s - %s", cleanArtist, cleanTitle))
-	if val, ok := s.coverCache.Load(key); ok {
-		if str, ok := val.(string); ok && strings.HasPrefix(str, "https://") {
-			return str
-		}
-	}
-	return ""
-}
-
 // SetChunkReader sets the chunk reader for embedded tag and artwork extraction.
 func (s *EnrichmentService) SetChunkReader(reader ChunkReader) {
 	s.mu.Lock()
@@ -294,52 +172,11 @@ func (s *EnrichmentService) SetArtworkDir(dir string) {
 	}
 }
 
-// SetDebug configures debug diagnostics and output log directory.
-func (s *EnrichmentService) SetDebug(enabled bool, filesDir string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.debugEnabled = enabled
-	if enabled && filesDir != "" {
-		logPath := filepath.Join(filesDir, "logs", "enrich.jsonl")
-		s.enrichLogFile = newEnrichmentRotatedFile(logPath, 5*1024*1024)
-		s.enrichRingBuffer = newEnrichmentRingBuffer(50)
-	}
-}
-
-// GetRecentEnrichmentLogs returns the most recent enrichment decision lines up to limit.
-func (s *EnrichmentService) GetRecentEnrichmentLogs(limit int) []string {
+// ArtworkDir returns the configured local artwork cache directory.
+func (s *EnrichmentService) ArtworkDir() string {
 	s.mu.RLock()
-	rb := s.enrichRingBuffer
-	s.mu.RUnlock()
-	if rb == nil {
-		return nil
-	}
-	return rb.Get(limit)
-}
-
-func (s *EnrichmentService) logEnrichmentRecord(rec EnrichmentRecord) {
-	s.mu.RLock()
-	enabled := s.debugEnabled
-	file := s.enrichLogFile
-	rb := s.enrichRingBuffer
-	s.mu.RUnlock()
-
-	if !enabled {
-		return
-	}
-
-	data, err := json.Marshal(rec)
-	if err != nil {
-		return
-	}
-	line := string(data)
-
-	if rb != nil {
-		rb.Add(line)
-	}
-	if file != nil {
-		_ = file.Append(data)
-	}
+	defer s.mu.RUnlock()
+	return s.artworkDir
 }
 
 // Stop gracefully stops the background enrichment queue.
@@ -350,7 +187,39 @@ func (s *EnrichmentService) Stop() {
 	s.wg.Wait()
 }
 
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	transientKeywords := []string{
+		"timeout",
+		"deadline exceeded",
+		"bot not ready",
+		"flood_wait",
+		"flood wait",
+		"connection reset",
+		"broken pipe",
+		"network is unreachable",
+		"no route to host",
+		"temporary failure",
+		"eof",
+		"too many requests",
+		"rate limit",
+	}
+	for _, kw := range transientKeywords {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // Enqueue adds a track ID to the background enrichment queue, deduplicating and skipping negative cached entries.
+// Uses bounded queue with backpressure instead of dropping.
 func (s *EnrichmentService) Enqueue(trackID string) {
 	if trackID == "" {
 		return
@@ -382,17 +251,56 @@ func (s *EnrichmentService) Enqueue(trackID string) {
 
 	select {
 	case s.queue <- trackID:
-	default:
-		logEnrich.Warnf("Enrichment queue full; dropping track %s", trackID)
+	case <-s.ctx.Done():
 	}
 }
 
-// CatchUpUnenriched enqueues all tracks that lack artwork or have default metadata for background enrichment.
+func (s *EnrichmentService) requeueWithDelay(trackID string, delay time.Duration) {
+	if trackID == "" {
+		return
+	}
+	select {
+	case <-s.ctx.Done():
+		return
+	case <-time.After(delay):
+	}
+	s.enqueuedMu.Lock()
+	delete(s.enqueuedMap, trackID)
+	s.enqueuedMu.Unlock()
+	s.Enqueue(trackID)
+}
+
+func (s *EnrichmentService) recordTransientRetry(ctx context.Context, trackID string, err error) {
+	attempts := 0
+	if s.db != nil {
+		attempts, _ = s.db.GetEnrichmentAttempts(ctx, trackID)
+	}
+	const maxTransientAttempts = 5
+	if attempts >= maxTransientAttempts {
+		logEnrich.Warnf("Max transient retry attempts (%d) reached for track %s; marking as failed", attempts, trackID)
+		if s.db != nil {
+			_ = s.db.SaveEnrichmentState(ctx, trackID, "failed", attempts+1, fmt.Sprintf("max transient retries exceeded: %v", err), 24*time.Hour)
+		}
+		return
+	}
+
+	backoff := 30 * time.Second * time.Duration(1<<uint(attempts))
+	if backoff > 10*time.Minute {
+		backoff = 10 * time.Minute
+	}
+	logEnrich.Warnf("Transient error extracting FLAC metadata for track %s (attempt %d/%d, backoff %v): %v",
+		trackID, attempts+1, maxTransientAttempts, backoff, err)
+	if s.db != nil {
+		_ = s.db.SaveEnrichmentState(ctx, trackID, "transient_retry", attempts+1, err.Error(), backoff)
+	}
+}
+
+// CatchUpUnenriched enqueues tracks that lack artwork or have default metadata for background enrichment.
 func (s *EnrichmentService) CatchUpUnenriched(ctx context.Context) {
 	if s.db == nil {
 		return
 	}
-	ids, err := s.db.ListUnenrichedTrackIDs(ctx)
+	ids, err := s.db.ListUnenrichedTrackIDs(ctx, 20)
 	if err != nil {
 		logEnrich.Warnf("Failed to query unenriched tracks: %v", err)
 		return
@@ -420,7 +328,6 @@ func (s *EnrichmentService) workerLoop() {
 		s.mu.RLock()
 		syncFn := s.isSyncing
 		playFn := s.isPlaybackActive
-		lastPlay := s.lastPlaybackSeen
 		s.mu.RUnlock()
 
 		if syncFn != nil && syncFn() {
@@ -432,11 +339,8 @@ func (s *EnrichmentService) workerLoop() {
 			continue
 		}
 
-		// 2. Pause entirely while any playback stream is active
+		// 2. Yield while playback has chunks pending or was read in the last few seconds
 		if playFn != nil && playFn() {
-			s.mu.Lock()
-			s.lastPlaybackSeen = time.Now()
-			s.mu.Unlock()
 			select {
 			case <-s.ctx.Done():
 				return
@@ -445,35 +349,103 @@ func (s *EnrichmentService) workerLoop() {
 			continue
 		}
 
-		// 3. Wait for short idle period (2s) after playback ends
-		if !lastPlay.IsZero() && time.Since(lastPlay) < 2*time.Second {
-			select {
-			case <-s.ctx.Done():
-				return
-			case <-time.After(500 * time.Millisecond):
-			}
-			continue
-		}
-
+		// 3. Process from queue first (bounded queue with backpressure)
 		select {
 		case <-s.ctx.Done():
 			return
 		case trackID := <-s.queue:
 			_ = s.EnrichTrack(s.ctx, trackID)
-			// Small pacing between requests to avoid burst rate-limits
 			select {
 			case <-s.ctx.Done():
 				return
 			case <-time.After(100 * time.Millisecond):
 			}
-		case <-time.After(500 * time.Millisecond):
+			continue
+		default:
+		}
+
+		// 4. If queue is empty, drain the backlog in small batches (20 tracks)
+		if s.db != nil {
+			batch, err := s.db.ListUnenrichedTrackIDs(s.ctx, 20)
+			if err == nil && len(batch) > 0 {
+				for _, trackID := range batch {
+					select {
+					case <-s.ctx.Done():
+						return
+					default:
+					}
+
+					// Yield if playback or sync starts during batch processing
+					s.mu.RLock()
+					playFn = s.isPlaybackActive
+					syncFn = s.isSyncing
+					s.mu.RUnlock()
+
+					for (playFn != nil && playFn()) || (syncFn != nil && syncFn()) {
+						select {
+						case <-s.ctx.Done():
+							return
+						case <-time.After(500 * time.Millisecond):
+						}
+						s.mu.RLock()
+						playFn = s.isPlaybackActive
+						syncFn = s.isSyncing
+						s.mu.RUnlock()
+					}
+
+					// Check if a higher-priority direct request entered the queue
+					select {
+					case qTrackID := <-s.queue:
+						_ = s.EnrichTrack(s.ctx, qTrackID)
+					default:
+					}
+
+					_ = s.EnrichTrack(s.ctx, trackID)
+
+					// Small pacing between tracks
+					select {
+					case <-s.ctx.Done():
+						return
+					case <-time.After(100 * time.Millisecond):
+					}
+				}
+				continue
+			}
+		}
+
+		// 5. Backlog is currently empty: wait for new queue items or idle poll
+		select {
+		case <-s.ctx.Done():
+			return
+		case trackID := <-s.queue:
+			_ = s.EnrichTrack(s.ctx, trackID)
+		case <-time.After(5 * time.Second):
 		}
 	}
 }
 
-// EnrichTrack fetches embedded artwork & tags, remote artwork fallback, and lyrics for a specific track.
+// EnrichTrack extracts embedded tags and artwork from the audio file first,
+// and falls back to online lookup only for fields still missing.
 func (s *EnrichmentService) EnrichTrack(ctx context.Context, trackID string) error {
 	if s.db == nil {
+		return nil
+	}
+
+	// Confirm background reads yield to active sync or playback (Task d)
+	s.mu.RLock()
+	syncFn := s.isSyncing
+	playFn := s.isPlaybackActive
+	s.mu.RUnlock()
+
+	if syncFn != nil && syncFn() {
+		// Yield to sync: re-queue track to process after sync completes
+		go s.requeueWithDelay(trackID, 2*time.Second)
+		return nil
+	}
+
+	if playFn != nil && playFn() {
+		// Yield to active playback: re-queue track to process when playback is idle
+		go s.requeueWithDelay(trackID, 1*time.Second)
 		return nil
 	}
 
@@ -487,57 +459,56 @@ func (s *EnrichmentService) EnrichTrack(ctx context.Context, trackID string) err
 	artworkDir := s.artworkDir
 	s.mu.RUnlock()
 
-	// Intelligently extract clean title, artist, album, version tags from tags and Telegram filename
-	structMeta := metadata.CleanMetadataStructured(track.Title, track.Artist, track.Album, track.FileName)
-	title := structMeta.Title
-	artist := strings.Join(structMeta.Artists, ", ")
-	album := track.Album
-	if structMeta.AlbumHint != "" && (album == "" || album == "Telegram Music") {
-		album = structMeta.AlbumHint
-	}
-	year := track.Year
-	durationSec := track.DurationSec
-
 	var localArt string
 	if artworkDir != "" {
 		localArt = filepath.Join(artworkDir, trackID+".jpg")
 	}
 
-	// 1. Check embedded cover art from local file
-	hasEmbeddedPic := false
+	staleArtOnDisk := false
 	if localArt != "" {
 		if fi, err := os.Stat(localArt); err == nil && fi.Size() > 0 {
-			hasEmbeddedPic = true
+			staleArtOnDisk = true
 		}
 	}
 
-	// 1b. If not on disk, try reading headers over MTProto via ReadHeader (lowest priority, no prefetch)
-	hasFreeCleanData := track.Title != "" && !strings.HasPrefix(track.Title, "Track ") &&
-		track.Artist != "" && track.Artist != "Unknown Artist" &&
-		track.DurationSec > 0
-
-	var headerMeta *metadata.AudioHeaderMeta
-	if !hasEmbeddedPic && reader != nil && !hasFreeCleanData {
-		readCtx, readCancel := context.WithTimeout(models.WithBackground(ctx), 4*time.Second)
-		var chunk []byte
-		var err error
-		if hr, ok := reader.(HeaderReader); ok {
-			chunk, err = hr.ReadHeader(readCtx, trackID, 256*1024)
-		} else {
-			chunk, err = reader.ReadChunk(readCtx, trackID, 0, 256*1024)
-		}
+	artWrittenThisRun := false
+	// 1. Always extract tags and artwork from the audio file first (authoritative source)
+	var flacMeta *metadata.FLACMetadata
+	if reader != nil {
+		readCtx, readCancel := context.WithTimeout(models.WithBackground(ctx), 30*time.Second)
+		meta, artWritten, extErr := metadata.ExtractEmbeddedMetadata(readCtx, trackID, reader, track.FileSize, artworkDir)
 		readCancel()
-		if err == nil && len(chunk) > 0 {
-			headerMeta = metadata.ParseAudioHeader(chunk)
-			if headerMeta != nil {
-				if len(headerMeta.Picture) > 0 && localArt != "" {
-					_ = os.WriteFile(localArt, headerMeta.Picture, 0644)
-					logEnrich.Infof("Extracted embedded cover art (%d bytes) for track %s", len(headerMeta.Picture), trackID)
-					hasEmbeddedPic = true
-				}
-				if headerMeta.Year > 0 && year == 0 {
-					year = headerMeta.Year
-				}
+
+		if extErr != nil {
+			if errors.Is(extErr, metadata.ErrUnsupportedContainer) {
+				logEnrich.Infof("Unsupported container for track %s: %v; falling back to online lookup without failed lock", trackID, extErr)
+			} else if isTransientError(extErr) && !staleArtOnDisk {
+				s.recordTransientRetry(ctx, trackID, extErr)
+				return extErr
+			} else {
+				logEnrich.Infof("Failure or timeout extracting embedded metadata for track %s: %v; proceeding with fallback (staleArtOnDisk=%v)", trackID, extErr, staleArtOnDisk)
+			}
+		} else {
+			flacMeta = meta
+			if artWritten {
+				artWrittenThisRun = true
+				logEnrich.Infof("Track %s: embedded cover art successfully extracted and written this run (%s)", trackID, localArt)
+			}
+		}
+	}
+
+	hasDecodableArt := false
+	if artWrittenThisRun {
+		hasDecodableArt = true
+	} else if staleArtOnDisk {
+		if metadata.IsValidImage(localArt) {
+			hasDecodableArt = true
+			logEnrich.Infof("Track %s: verified valid existing embedded cover art on disk (%s)", trackID, localArt)
+		} else {
+			logEnrich.Warnf("Track %s: stale cover art on disk is corrupt or invalid image (%s); discarding", trackID, localArt)
+			_ = os.Remove(localArt)
+			if artworkDir != "" {
+				_ = os.Remove(filepath.Join(artworkDir, trackID+".orig"))
 			}
 		}
 	}
@@ -545,126 +516,102 @@ func (s *EnrichmentService) EnrichTrack(ctx context.Context, trackID string) err
 	var coverURL, thumbURL string
 	var matchSource string
 	var matchScore float64
-	var metaVersion int = 2
-	var decision DecisionLogDetails
-	provLogs := make(map[string]ProviderLog)
-	var allQueriesSent []string
+	var metaVersion int = 3
 
-	if hasEmbeddedPic {
-		// Source order (a): embedded art via content:// provider (Prompt 4 requirement)
+	if hasDecodableArt {
+		// Embedded art confirmed on disk -> serve via content:// provider URL (Bug 1 fix)
 		coverURL = fmt.Sprintf("content://com.music.streamx.extensions.telegram.source/art/%s", trackID)
 		thumbURL = coverURL
 		matchSource = "embedded"
 		matchScore = 1.0
-		decision = DecisionLogDetails{
-			Provider: "embedded",
-			Rule:     "exact",
+
+		if flacMeta != nil {
+			_ = s.db.SaveEmbeddedTrackMetadata(ctx, trackID, flacMeta, coverURL, thumbURL)
+		} else {
+			_ = s.db.UpdateTrackFullMetadata(ctx, trackID, track.Title, track.Artist, track.Album, coverURL, thumbURL, "", "", track.Year)
+			_ = s.db.UpdateTrackMatchMetadata(ctx, trackID, matchSource, matchScore, metaVersion)
+		}
+		_ = s.db.SaveEnrichmentState(ctx, trackID, "success", 1, "embedded art and tags", 30*24*time.Hour)
+		if artWrittenThisRun {
+			logEnrich.Infof("Successfully enriched track %s from embedded audio file (art written this run)", trackID)
+		} else {
+			logEnrich.Infof("Successfully enriched track %s from embedded audio file (art validated from disk)", trackID)
 		}
 	} else {
-		// Source order (b): online lookup only when no embedded art
-		durationBucket := durationSec / 10
-		cacheKey := strings.ToLower(fmt.Sprintf("%s|%s|%d|%s", strings.Join(structMeta.SearchArtists, ","), structMeta.SearchTitle, durationBucket, structMeta.AlbumHint))
-		if val, ok := s.coverCache.Load(cacheKey); ok {
-			coverURL = val.(string)
-			thumbURL = coverURL
-			matchSource = "cache"
-			matchScore = 0.90
-			decision = DecisionLogDetails{
-				Provider: "cache",
-				Rule:     "exact",
+		// No embedded picture found in the audio file:
+		// Save embedded tags if extracted, then fall back to online cover art search
+		if flacMeta != nil {
+			_ = s.db.SaveEmbeddedTrackMetadata(ctx, trackID, flacMeta, "", "")
+			if updated, err := s.db.GetTrack(ctx, trackID); err == nil && updated != nil {
+				track = updated
+			}
+		}
+
+		structMeta := metadata.CleanMetadataStructured(track.Title, track.Artist, track.Album, track.FileName)
+		title := structMeta.Title
+		artist := strings.Join(structMeta.Artists, ", ")
+		album := track.Album
+		if structMeta.AlbumHint != "" && (album == "" || album == "Telegram Music") {
+			album = structMeta.AlbumHint
+		}
+		year := track.Year
+		durationSec := track.DurationSec
+
+		cand, score, _, reason, err := s.FindCoverScored(ctx, structMeta, durationSec)
+		if err == nil && cand != nil && score >= 0.70 {
+			coverURL = cand.ImageURL
+			thumbURL = cand.ImageURL
+			matchSource = cand.Provider
+			matchScore = score
+			if cand.Album != "" && (album == "" || album == "Telegram Music") {
+				album = cand.Album
+			}
+			if cand.Year > 0 && year == 0 {
+				year = cand.Year
 			}
 		} else {
-			cand, score, rule, reason, plogs, queries, err := s.FindCoverScored(ctx, structMeta, durationSec)
-			provLogs = plogs
-			allQueriesSent = queries
-			if err == nil && cand != nil && score >= 0.70 {
-				coverURL = cand.ImageURL
-				thumbURL = cand.ImageURL
-				matchSource = cand.Provider
-				matchScore = score
-				if cand.Album != "" && (album == "" || album == "Telegram Music") {
-					album = cand.Album
+			matchSource = "none"
+			matchScore = 0.0
+			logEnrich.Infof("No confident cover match for %s: %s (reason: %s)", trackID, title, reason)
+		}
+
+		if coverURL != "" {
+			_ = s.db.UpdateTrackFullMetadata(ctx, trackID, title, artist, album, coverURL, thumbURL, "", "", year)
+			_ = s.db.UpdateTrackMatchMetadata(ctx, trackID, matchSource, matchScore, metaVersion)
+			_ = s.db.SaveEnrichmentState(ctx, trackID, "success", 1, "matched "+matchSource, 30*24*time.Hour)
+			logEnrich.Infof("Successfully enriched track %s with online cover (%s, score: %.2f)", trackID, matchSource, matchScore)
+		} else {
+			var fallbackArt string
+			if artworkDir != "" {
+				artPath := filepath.Join(artworkDir, trackID+".jpg")
+				if fi, err := os.Stat(artPath); err == nil && fi.Size() > 0 {
+					fallbackArt = fmt.Sprintf("content://com.music.streamx.extensions.telegram.source/art/%s", trackID)
 				}
-				if cand.Year > 0 && year == 0 {
-					year = cand.Year
-				}
-				s.coverCache.Store(cacheKey, coverURL)
-				decision = DecisionLogDetails{
-					Provider: cand.Provider,
-					Rule:     rule,
-					AcceptedCandidate: &CandidateItem{
-						Title:       cand.Title,
-						Artist:      strings.Join(cand.Artists, ", "),
-						DurationSec: cand.DurationSec,
-					},
-				}
-			} else {
-				// Prefer no cover over a wrong cover
-				matchSource = "none"
-				matchScore = 0.0
-				decision = DecisionLogDetails{
-					Provider: "none",
-					Rule:     rule,
-				}
-				logEnrich.Infof("No confident cover match for %s: %s (reason: %s)", trackID, title, reason)
 			}
+			_ = s.db.UpdateTrackFullMetadata(ctx, trackID, title, artist, album, fallbackArt, fallbackArt, "", "", year)
+			_ = s.db.UpdateTrackMatchMetadata(ctx, trackID, "none", 0.0, metaVersion)
+			_ = s.db.SaveEnrichmentState(ctx, trackID, "failed", 1, "no confident cover match", 24*time.Hour)
 		}
 	}
 
-	// 3. Lyrics retrieval
-	var plainLyrics, syncedLyrics string
-	if track.Lyrics == "" && title != "" {
-		firstArtist := ""
-		if len(structMeta.Artists) > 0 {
-			firstArtist = structMeta.Artists[0]
+	// 2. Lyrics retrieval
+	if track.Lyrics == "" && track.Title != "" {
+		firstArtist := track.Artist
+		if flacMeta != nil && len(flacMeta.Artists) > 0 {
+			firstArtist = flacMeta.Artists[0]
 		}
-		res, err := s.FindLyrics(ctx, title, firstArtist)
+		res, err := s.FindLyrics(ctx, track.Title, firstArtist)
 		if err == nil && res != nil {
-			plainLyrics = res.PlainLyrics
-			syncedLyrics = res.SyncedLyrics
+			_ = s.db.UpdateTrackFullMetadata(ctx, trackID, "", "", "", "", "", res.PlainLyrics, res.SyncedLyrics, 0)
 		}
 	}
-
-	// 4. Persist enrichment in DB
-	if coverURL != "" {
-		_ = s.db.UpdateTrackFullMetadata(ctx, trackID, title, artist, album, coverURL, thumbURL, plainLyrics, syncedLyrics, year)
-		_ = s.db.UpdateTrackMatchMetadata(ctx, trackID, matchSource, matchScore, metaVersion)
-		_ = s.db.SaveEnrichmentState(ctx, trackID, "success", 1, "matched "+matchSource, 30*24*time.Hour)
-		logEnrich.Infof("Successfully enriched track %s: %s - %s (source: %s, score: %.2f)", trackID, artist, title, matchSource, matchScore)
-	} else {
-		_ = s.db.UpdateTrackFullMetadata(ctx, trackID, title, artist, album, "", "", plainLyrics, syncedLyrics, year)
-		_ = s.db.UpdateTrackMatchMetadata(ctx, trackID, "none", 0.0, metaVersion)
-		_ = s.db.SaveEnrichmentState(ctx, trackID, "failed", 1, "no confident cover match", 24*time.Hour)
-	}
-
-	s.logEnrichmentRecord(EnrichmentRecord{
-		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-		TrackID:   trackID,
-		RawTags: map[string]string{
-			"title":  track.Title,
-			"artist": track.Artist,
-			"album":  track.Album,
-		},
-		RawFilename: track.FileName,
-		Cleaned: map[string]string{
-			"title":  title,
-			"artist": artist,
-		},
-		QueriesSent:   allQueriesSent,
-		Providers:     provLogs,
-		Decision:      decision,
-		FinalCoverURL: coverURL,
-	})
 
 	return nil
 }
 
 // FindCoverScored runs external candidate retrieval across providers (JioSaavn, iTunes IN/US, Deezer, MusicBrainz),
 // evaluates candidates using ScoreCandidate against structured metadata, and picks the highest scoring candidate above threshold.
-func (s *EnrichmentService) FindCoverScored(ctx context.Context, local metadata.StructuredMetadata, localDurationSec int) (*CoverCandidate, float64, string, string, map[string]ProviderLog, []string, error) {
-	provLogs := make(map[string]ProviderLog)
-	var allQueries []string
-
+func (s *EnrichmentService) FindCoverScored(ctx context.Context, local metadata.StructuredMetadata, localDurationSec int) (*CoverCandidate, float64, string, string, error) {
 	type providerSearcher struct {
 		name string
 		fn   func() ([]CoverCandidate, []string, error)
@@ -699,22 +646,7 @@ func (s *EnrichmentService) FindCoverScored(ctx context.Context, local metadata.
 
 	var allScored []CandidateScore
 	for _, searcher := range searchers {
-		cands, queries, err := searcher.fn()
-		allQueries = append(allQueries, queries...)
-
-		var logCands []CandidateItem
-		for _, c := range cands {
-			logCands = append(logCands, CandidateItem{
-				Title:       c.Title,
-				Artist:      strings.Join(c.Artists, ", "),
-				DurationSec: c.DurationSec,
-			})
-		}
-		provLogs[searcher.name] = ProviderLog{
-			Queries:    queries,
-			Candidates: logCands,
-		}
-
+		cands, _, err := searcher.fn()
 		if err != nil || len(cands) == 0 {
 			continue
 		}
@@ -737,13 +669,13 @@ func (s *EnrichmentService) FindCoverScored(ctx context.Context, local metadata.
 			})
 			if allScored[0].Score >= 0.85 {
 				best := allScored[0]
-				return &best.Candidate, best.Score, best.Rule, best.Reason, provLogs, allQueries, nil
+				return &best.Candidate, best.Score, best.Rule, best.Reason, nil
 			}
 		}
 	}
 
 	if len(allScored) == 0 {
-		return nil, 0, "none", "no candidates met threshold", provLogs, allQueries, fmt.Errorf("no candidate accepted")
+		return nil, 0, "none", "no candidates met threshold", fmt.Errorf("no candidate accepted")
 	}
 
 	sort.Slice(allScored, func(i, j int) bool {
@@ -758,38 +690,19 @@ func (s *EnrichmentService) FindCoverScored(ctx context.Context, local metadata.
 	best := allScored[0]
 	finalScore, finalRule, finalReason := ScoreCandidate(local, localDurationSec, best.Candidate, runnerUp)
 	if finalScore > 0 {
-		return &best.Candidate, finalScore, finalRule, finalReason, provLogs, allQueries, nil
+		return &best.Candidate, finalScore, finalRule, finalReason, nil
 	}
 
-	return nil, 0, "below_threshold", finalReason, provLogs, allQueries, fmt.Errorf("no candidate accepted")
-}
-
-func (s *EnrichmentService) FindCoverWithDecision(ctx context.Context, title, artist, album string) (coverURL, thumbURL, foundAlbum string, year int, decision DecisionLogDetails, provLogs map[string]ProviderLog, queriesSent []string, err error) {
-	structMeta := metadata.CleanMetadataStructured(title, artist, album, "")
-	cand, _, rule, reason, plogs, qSent, err := s.FindCoverScored(ctx, structMeta, 0)
-	if err != nil || cand == nil {
-		decision = DecisionLogDetails{
-			Provider: "none",
-			Rule:     rule,
-		}
-		return "", "", "", 0, decision, plogs, qSent, fmt.Errorf("no cover found: %s", reason)
-	}
-
-	decision = DecisionLogDetails{
-		Provider: cand.Provider,
-		Rule:     rule,
-		AcceptedCandidate: &CandidateItem{
-			Title:       cand.Title,
-			Artist:      strings.Join(cand.Artists, ", "),
-			DurationSec: cand.DurationSec,
-		},
-	}
-	return cand.ImageURL, cand.ImageURL, cand.Album, cand.Year, decision, plogs, qSent, nil
+	return nil, 0, "below_threshold", finalReason, fmt.Errorf("no candidate accepted")
 }
 
 func (s *EnrichmentService) FindCover(ctx context.Context, title, artist, album string) (coverURL, thumbURL, foundAlbum string, year int, err error) {
-	c, th, alb, y, _, _, _, err := s.FindCoverWithDecision(ctx, title, artist, album)
-	return c, th, alb, y, err
+	structMeta := metadata.CleanMetadataStructured(title, artist, album, "")
+	cand, _, _, reason, err := s.FindCoverScored(ctx, structMeta, 0)
+	if err != nil || cand == nil {
+		return "", "", "", 0, fmt.Errorf("no cover found: %s", reason)
+	}
+	return cand.ImageURL, cand.ImageURL, cand.Album, cand.Year, nil
 }
 
 func coreSongTitle(title string) string {
@@ -824,6 +737,11 @@ func splitArtists(artistStr string) []string {
 		}
 	}
 	return result
+}
+
+// SplitArtists splits multi-artist strings using standard delimiters and feature tags.
+func SplitArtists(artistStr string) []string {
+	return splitArtists(artistStr)
 }
 
 func parseDuration(v interface{}) int {
